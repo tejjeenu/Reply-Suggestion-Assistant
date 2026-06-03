@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -19,7 +20,12 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.provider.Settings
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
 import android.view.WindowManager
+import android.widget.TextView
 import java.io.IOException
 
 class CaptureService : Service() {
@@ -30,6 +36,9 @@ class CaptureService : Service() {
     private var imageReader: ImageReader? = null
     private var projectionThread: HandlerThread? = null
     private var projectionHandler: Handler? = null
+    private var windowManager: WindowManager? = null
+    private var overlayView: View? = null
+    private var overlayListener: OverlayListener? = null
 
     @Volatile
     private var projectionReady = false
@@ -66,7 +75,57 @@ class CaptureService : Service() {
         }
     }
 
+    fun setOverlayListener(listener: OverlayListener?) {
+        overlayListener = listener
+    }
+
+    fun showFloatingControl(): Boolean {
+        if (overlayView != null) return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            return false
+        }
+
+        val manager = getSystemService(WindowManager::class.java)
+        windowManager = manager
+
+        val control = TextView(this).apply {
+            text = "RA"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(24, 96, 168))
+            gravity = Gravity.CENTER
+            elevation = 12f
+            contentDescription = "Reply Assistant capture"
+            setOnTouchListener(FloatingControlTouchListener())
+        }
+
+        val params = WindowManager.LayoutParams(
+            FLOATING_CONTROL_SIZE_PX,
+            FLOATING_CONTROL_SIZE_PX,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = FLOATING_CONTROL_INITIAL_X
+            y = FLOATING_CONTROL_INITIAL_Y
+        }
+
+        manager.addView(control, params)
+        overlayView = control
+        return true
+    }
+
+    fun hideFloatingControl() {
+        val view = overlayView ?: return
+        runCatching { windowManager?.removeView(view) }
+        overlayView = null
+    }
+
     override fun onDestroy() {
+        hideFloatingControl()
+        overlayListener = null
         projectionReady = false
         virtualDisplay?.release()
         virtualDisplay = null
@@ -237,6 +296,52 @@ class CaptureService : Service() {
             get() = this@CaptureService
     }
 
+    interface OverlayListener {
+        fun onFloatingCaptureRequested()
+    }
+
+    private inner class FloatingControlTouchListener : View.OnTouchListener {
+        private var initialX = 0
+        private var initialY = 0
+        private var initialTouchX = 0f
+        private var initialTouchY = 0f
+        private var moved = false
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            val params = view.layoutParams as WindowManager.LayoutParams
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = params.x
+                    initialY = params.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    moved = false
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    if (kotlin.math.abs(dx) > DRAG_SLOP_PX || kotlin.math.abs(dy) > DRAG_SLOP_PX) {
+                        moved = true
+                    }
+                    params.x = initialX + dx
+                    params.y = initialY + dy
+                    windowManager?.updateViewLayout(view, params)
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) {
+                        overlayListener?.onFloatingCaptureRequested()
+                    }
+                    return true
+                }
+            }
+
+            return false
+        }
+    }
+
     companion object {
         const val EXTRA_RESULT_CODE = "com.replyassistant.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "com.replyassistant.extra.RESULT_DATA"
@@ -247,6 +352,19 @@ class CaptureService : Service() {
         private const val CAPTURE_RETRY_DELAY_MS = 120L
         private const val NOTIFICATION_ID = 42
         private const val NOTIFICATION_CHANNEL_ID = "screen_capture"
+        private const val FLOATING_CONTROL_SIZE_PX = 144
+        private const val FLOATING_CONTROL_INITIAL_X = 24
+        private const val FLOATING_CONTROL_INITIAL_Y = 220
+        private const val DRAG_SLOP_PX = 8
+    }
+}
+
+private fun overlayWindowType(): Int {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+    } else {
+        @Suppress("DEPRECATION")
+        WindowManager.LayoutParams.TYPE_PHONE
     }
 }
 

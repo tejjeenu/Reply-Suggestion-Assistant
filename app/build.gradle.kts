@@ -4,6 +4,51 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+fun parseDotEnvValue(value: String): String {
+    var parsed = value.trim()
+    val commentIndex = parsed.indexOf(" #")
+    if (commentIndex != -1) {
+        parsed = parsed.substring(0, commentIndex).trim()
+    }
+
+    if (
+        (parsed.startsWith("\"") && parsed.endsWith("\"")) ||
+        (parsed.startsWith("'") && parsed.endsWith("'"))
+    ) {
+        parsed = parsed.substring(1, parsed.length - 1)
+    }
+
+    return parsed.replace("\\n", "\n")
+}
+
+fun readDotEnvValue(keys: Set<String>): String {
+    val envFiles = listOf(rootProject.file(".env"), rootProject.file("backend/.env"))
+    val linePattern = Regex("^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.*)\\s*$")
+
+    for (file in envFiles) {
+        if (!file.exists()) continue
+
+        for (line in file.readLines()) {
+            val match = linePattern.matchEntire(line) ?: continue
+            val key = match.groupValues[1]
+            if (key !in keys) continue
+
+            val value = parseDotEnvValue(match.groupValues[2])
+            if (value.isNotBlank()) return value
+        }
+    }
+
+    return ""
+}
+
+fun String.asBuildConfigString(): String {
+    return "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+}
+
+val defaultBackendUrl = providers.environmentVariable("BACKEND_URL").orNull
+    ?: providers.environmentVariable("backend_url").orNull
+    ?: readDotEnvValue(setOf("BACKEND_URL", "backend_url"))
+
 android {
     namespace = "com.replyassistant"
     compileSdk = 35
@@ -14,9 +59,12 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField("String", "DEFAULT_BACKEND_URL", defaultBackendUrl.asBuildConfigString())
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 

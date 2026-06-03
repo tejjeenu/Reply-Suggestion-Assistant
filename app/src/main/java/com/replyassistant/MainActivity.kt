@@ -6,10 +6,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Bitmap
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.Settings
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,15 +53,24 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.replyassistant.capture.CaptureService
 import com.replyassistant.network.SuggestionApi
+import com.replyassistant.network.SuggestionImage
 import com.replyassistant.network.SuggestionRequest
 import com.replyassistant.ocr.OcrProcessor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 data class CapturedText(
     val id: Long,
     val title: String,
-    val text: String
+    val text: String,
+    val imageMimeType: String? = null,
+    val imageBase64: String? = null
 )
 
 class MainActivity : ComponentActivity() {
@@ -69,9 +82,15 @@ class MainActivity : ComponentActivity() {
     private var captureActive by mutableStateOf(false)
     private var isBusy by mutableStateOf(false)
     private var statusMessage by mutableStateOf("Ready")
-    private var backendUrl by mutableStateOf("")
+    private var backendUrl by mutableStateOf(
+        SuggestionApi.normalizeSuggestEndpoint(BuildConfig.DEFAULT_BACKEND_URL)
+    )
     private var sourceApp by mutableStateOf("Current app")
     private var tone by mutableStateOf("casual, natural, helpful")
+    private var floatingControlEnabled by mutableStateOf(false)
+    private var overlayPermissionGranted by mutableStateOf(false)
+    private var burstCountText by mutableStateOf("3")
+    private var burstIntervalMsText by mutableStateOf("1200")
     private var contextDraft by mutableStateOf("")
     private var suggestions by mutableStateOf<List<String>>(emptyList())
 
@@ -95,13 +114,20 @@ class MainActivity : ComponentActivity() {
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            captureService = (binder as CaptureService.LocalBinder).service
+            val service = (binder as CaptureService.LocalBinder).service
+            captureService = service
+            service.setOverlayListener(overlayListener)
             isBound = true
             captureActive = true
-            statusMessage = "Capture session ready."
+            if (floatingControlEnabled) {
+                showFloatingControlIfPossible(service)
+            } else {
+                statusMessage = "Capture session ready."
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            captureService?.setOverlayListener(null)
             captureService = null
             isBound = false
             captureActive = false
@@ -109,8 +135,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val overlayListener = object : CaptureService.OverlayListener {
+        override fun onFloatingCaptureRequested() {
+            runOnUiThread {
+                captureBurstAndGenerate(fromFloatingControl = true)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        refreshOverlayPermissionStatus()
         requestNotificationPermissionIfNeeded()
 
         setContent {
@@ -123,16 +158,25 @@ class MainActivity : ComponentActivity() {
                     backendUrl = backendUrl,
                     sourceApp = sourceApp,
                     tone = tone,
+                    floatingControlEnabled = floatingControlEnabled,
+                    overlayPermissionGranted = overlayPermissionGranted,
+                    burstCount = burstCountText,
+                    burstIntervalMs = burstIntervalMsText,
                     captures = captures,
                     contextDraft = contextDraft,
                     suggestions = suggestions,
                     onBackendUrlChange = { backendUrl = it },
                     onSourceAppChange = { sourceApp = it },
                     onToneChange = { tone = it },
+                    onRequestOverlayPermission = ::requestOverlayPermission,
+                    onFloatingControlChange = ::updateFloatingControlEnabled,
+                    onBurstCountChange = { burstCountText = it.filter { char -> char.isDigit() }.take(1) },
+                    onBurstIntervalMsChange = { burstIntervalMsText = it.filter { char -> char.isDigit() }.take(5) },
                     onContextChange = { contextDraft = it },
                     onStartCapture = ::requestScreenCapture,
                     onCaptureScreen = ::captureAndRunOcr,
                     onCaptureAfterDelay = ::captureAfterDelay,
+                    onCaptureBurst = { captureBurstAndGenerate(fromFloatingControl = false) },
                     onStopCapture = ::stopCapture,
                     onGenerate = ::generateSuggestions,
                     onRemoveCapture = ::removeCapture
@@ -141,8 +185,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshOverlayPermissionStatus()
+        if (floatingControlEnabled && overlayPermissionGranted) {
+            captureService?.let(::showFloatingControlIfPossible)
+        }
+    }
+
     override fun onDestroy() {
         if (isBound) {
+            captureService?.setOverlayListener(null)
+            captureService?.hideFloatingControl()
             unbindService(serviceConnection)
             isBound = false
         }
@@ -153,6 +207,65 @@ class MainActivity : ComponentActivity() {
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun refreshOverlayPermissionStatus() {
+        overlayPermissionGranted = canDrawOverlays()
+    }
+
+    private fun canDrawOverlays(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+    }
+
+    private fun requestOverlayPermission() {
+        if (canDrawOverlays()) {
+            overlayPermissionGranted = true
+            statusMessage = "Floating control permission is already enabled."
+            return
+        }
+
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName")
+        )
+        startActivity(intent)
+        statusMessage = "Enable display-over-other-apps permission, then return to Reply Assistant."
+    }
+
+    private fun updateFloatingControlEnabled(enabled: Boolean) {
+        if (enabled && !canDrawOverlays()) {
+            floatingControlEnabled = false
+            refreshOverlayPermissionStatus()
+            requestOverlayPermission()
+            return
+        }
+
+        floatingControlEnabled = enabled
+        if (enabled) {
+            val service = captureService
+            if (service == null || !isBound) {
+                statusMessage = "Start a capture session before showing the floating control."
+                return
+            }
+            showFloatingControlIfPossible(service)
+        } else {
+            captureService?.hideFloatingControl()
+            statusMessage = "Floating control hidden."
+        }
+    }
+
+    private fun showFloatingControlIfPossible(service: CaptureService) {
+        refreshOverlayPermissionStatus()
+        if (!overlayPermissionGranted) {
+            statusMessage = "Overlay permission is needed for the floating control."
+            return
+        }
+
+        statusMessage = if (service.showFloatingControl()) {
+            "Floating control ready. Tap it over another app to capture a burst and generate replies."
+        } else {
+            "Floating control could not be shown. Check overlay permission."
         }
     }
 
@@ -178,18 +291,20 @@ class MainActivity : ComponentActivity() {
 
     private fun stopCapture() {
         if (isBound) {
+            captureService?.setOverlayListener(null)
+            captureService?.hideFloatingControl()
             unbindService(serviceConnection)
             isBound = false
         }
         captureService = null
         captureActive = false
+        floatingControlEnabled = false
         stopService(Intent(this, CaptureService::class.java))
         statusMessage = "Capture session stopped."
     }
 
     private fun captureAndRunOcr() {
-        val service = captureService
-        if (!isBound || service == null) {
+        if (!isBound || captureService == null) {
             statusMessage = "Start a capture session first."
             return
         }
@@ -197,42 +312,136 @@ class MainActivity : ComponentActivity() {
         isBusy = true
         statusMessage = "Capturing screen..."
 
-        service.captureScreenshot { result ->
-            runOnUiThread {
-                result
-                    .onSuccess { bitmap ->
-                        statusMessage = "Running OCR..."
-                        ocrProcessor.extractText(
-                            bitmap = bitmap,
-                            onSuccess = { rawText ->
-                                bitmap.recycle()
-                                val cleanedText = TextCleaner.clean(rawText)
-                                val capture = CapturedText(
-                                    id = System.currentTimeMillis(),
-                                    title = "Screenshot ${captures.size + 1}",
-                                    text = cleanedText.ifBlank { "No readable text found." }
-                                )
-                                captures.add(capture)
-                                contextDraft = buildContextDraft()
-                                suggestions = emptyList()
-                                isBusy = false
-                                statusMessage = if (cleanedText.isBlank()) {
-                                    "Captured, but OCR found no readable text."
-                                } else {
-                                    "Captured and extracted text."
+        lifecycleScope.launch {
+            val result = captureAndStoreScreenshot()
+            statusMessage = result.fold(
+                onSuccess = { hadText ->
+                    if (hadText) {
+                        "Captured and extracted text."
+                    } else {
+                        "Captured, but OCR found no readable text. The image will still be sent to Scout."
+                    }
+                },
+                onFailure = { error -> "Capture failed: ${error.message}" }
+            )
+            isBusy = false
+        }
+    }
+
+    private fun captureBurstAndGenerate(fromFloatingControl: Boolean) {
+        if (!isBound || captureService == null) {
+            statusMessage = "Start a capture session first."
+            return
+        }
+
+        if (isBusy) {
+            statusMessage = "Reply Assistant is already working."
+            return
+        }
+
+        val count = normalizedBurstCount()
+        val intervalMs = normalizedBurstIntervalMs()
+        val shouldRestoreFloatingControl = fromFloatingControl && floatingControlEnabled
+
+        isBusy = true
+        suggestions = emptyList()
+
+        lifecycleScope.launch {
+            if (shouldRestoreFloatingControl) {
+                captureService?.hideFloatingControl()
+                delay(250)
+            }
+
+            var capturedCount = 0
+            var lastError: Throwable? = null
+
+            for (index in 1..count) {
+                statusMessage = "Capturing screenshot $index of $count..."
+                val result = captureAndStoreScreenshot()
+                if (result.isSuccess) {
+                    capturedCount += 1
+                } else {
+                    lastError = result.exceptionOrNull()
+                }
+
+                if (index < count) {
+                    statusMessage = "Move to the next relevant screen. Next capture in ${intervalMs}ms."
+                    delay(intervalMs.toLong())
+                }
+            }
+
+            if (capturedCount == 0) {
+                statusMessage = "Burst capture failed: ${lastError?.message ?: "No screenshots captured."}"
+                isBusy = false
+                if (shouldRestoreFloatingControl) captureService?.let(::showFloatingControlIfPossible)
+                return@launch
+            }
+
+            statusMessage = "Captured $capturedCount screenshot${if (capturedCount == 1) "" else "s"}. Generating replies..."
+            val suggestionResult = requestSuggestions()
+
+            suggestions = suggestionResult.getOrElse { error ->
+                statusMessage = "Suggestion request failed: ${error.message}"
+                emptyList()
+            }
+
+            if (suggestions.isNotEmpty()) {
+                statusMessage = "Suggestions ready."
+            }
+
+            isBusy = false
+            if (shouldRestoreFloatingControl) captureService?.let(::showFloatingControlIfPossible)
+        }
+    }
+
+    private suspend fun captureAndStoreScreenshot(): Result<Boolean> {
+        val service = captureService
+        if (!isBound || service == null) {
+            return Result.failure(IOException("Start a capture session first."))
+        }
+
+        return suspendCancellableCoroutine { continuation ->
+            service.captureScreenshot { result ->
+                runOnUiThread {
+                    result
+                        .onSuccess { bitmap ->
+                            statusMessage = "Running OCR..."
+                            ocrProcessor.extractText(
+                                bitmap = bitmap,
+                                onSuccess = { rawText ->
+                                    val cleanedText = TextCleaner.clean(rawText)
+                                    val imageForVision = ScreenshotEncoder.encodeForVision(bitmap)
+                                    bitmap.recycle()
+
+                                    val capture = CapturedText(
+                                        id = System.currentTimeMillis(),
+                                        title = "Screenshot ${captures.size + 1}",
+                                        text = cleanedText.ifBlank { "No readable text found." },
+                                        imageMimeType = imageForVision?.mimeType,
+                                        imageBase64 = imageForVision?.base64
+                                    )
+                                    captures.add(capture)
+                                    contextDraft = buildContextDraft()
+                                    suggestions = emptyList()
+
+                                    if (continuation.isActive) {
+                                        continuation.resume(Result.success(cleanedText.isNotBlank()))
+                                    }
+                                },
+                                onError = { error ->
+                                    bitmap.recycle()
+                                    if (continuation.isActive) {
+                                        continuation.resume(Result.failure(error))
+                                    }
                                 }
-                            },
-                            onError = { error ->
-                                bitmap.recycle()
-                                isBusy = false
-                                statusMessage = "OCR failed: ${error.message}"
+                            )
+                        }
+                        .onFailure { error ->
+                            if (continuation.isActive) {
+                                continuation.resume(Result.failure(error))
                             }
-                        )
-                    }
-                    .onFailure { error ->
-                        isBusy = false
-                        statusMessage = "Capture failed: ${error.message}"
-                    }
+                        }
+                }
             }
         }
     }
@@ -254,8 +463,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun generateSuggestions() {
-        val contextText = contextDraft.trim()
-        if (contextText.isBlank()) {
+        if (contextDraft.trim().isBlank()) {
             statusMessage = "Capture or enter some context first."
             return
         }
@@ -264,16 +472,7 @@ class MainActivity : ComponentActivity() {
         statusMessage = "Generating replies..."
 
         lifecycleScope.launch {
-            val result = runCatching {
-                SuggestionApi.suggestReplies(
-                    endpoint = backendUrl.trim(),
-                    request = SuggestionRequest(
-                        sourceApp = sourceApp,
-                        tone = tone,
-                        contextText = contextText
-                    )
-                )
-            }
+            val result = requestSuggestions()
 
             suggestions = result.getOrElse { error ->
                 statusMessage = "Suggestion request failed: ${error.message}"
@@ -287,6 +486,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private suspend fun requestSuggestions(): Result<List<String>> {
+        val contextText = contextDraft.trim()
+        if (contextText.isBlank()) {
+            return Result.failure(IOException("Capture or enter some context first."))
+        }
+
+        return runCatching {
+            SuggestionApi.suggestReplies(
+                endpoint = backendUrl.trim(),
+                request = SuggestionRequest(
+                    sourceApp = sourceApp,
+                    tone = tone,
+                    contextText = contextText,
+                    images = captures.takeLast(5).mapNotNull { it.toSuggestionImage() }
+                )
+            )
+        }
+    }
+
+    private fun normalizedBurstCount(): Int {
+        return burstCountText.toIntOrNull()?.coerceIn(1, 5) ?: 3
+    }
+
+    private fun normalizedBurstIntervalMs(): Int {
+        return burstIntervalMsText.toIntOrNull()?.coerceIn(500, 5_000) ?: 1_200
+    }
+
     private fun removeCapture(id: Long) {
         captures.removeAll { it.id == id }
         contextDraft = buildContextDraft()
@@ -298,6 +524,85 @@ class MainActivity : ComponentActivity() {
             "[${capture.title}]\n${capture.text}"
         }
     }
+}
+
+data class EncodedImage(
+    val mimeType: String,
+    val base64: String
+)
+
+object ScreenshotEncoder {
+    private const val MIME_TYPE = "image/jpeg"
+    private const val MAX_DIMENSION = 1280
+    private const val MIN_DIMENSION = 720
+    private const val INITIAL_JPEG_QUALITY = 72
+    private const val MIN_JPEG_QUALITY = 42
+    private const val MAX_IMAGE_BYTES = 500_000
+
+    fun encodeForVision(bitmap: Bitmap): EncodedImage? {
+        return runCatching { encode(bitmap) }.getOrNull()
+    }
+
+    private fun encode(bitmap: Bitmap): EncodedImage {
+        var maxDimension = MAX_DIMENSION
+        var quality = INITIAL_JPEG_QUALITY
+        var workingBitmap = bitmap.scaledToMaxDimension(maxDimension)
+        var shouldRecycleWorkingBitmap = workingBitmap !== bitmap
+
+        try {
+            while (true) {
+                val bytes = workingBitmap.compressJpeg(quality)
+                if (
+                    bytes.size <= MAX_IMAGE_BYTES ||
+                    (quality <= MIN_JPEG_QUALITY && maxDimension <= MIN_DIMENSION)
+                ) {
+                    return EncodedImage(
+                        mimeType = MIME_TYPE,
+                        base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    )
+                }
+
+                if (quality > MIN_JPEG_QUALITY) {
+                    quality -= 10
+                } else {
+                    if (shouldRecycleWorkingBitmap) {
+                        workingBitmap.recycle()
+                    }
+                    maxDimension = (maxDimension * 0.8f).roundToInt().coerceAtLeast(MIN_DIMENSION)
+                    quality = INITIAL_JPEG_QUALITY
+                    workingBitmap = bitmap.scaledToMaxDimension(maxDimension)
+                    shouldRecycleWorkingBitmap = workingBitmap !== bitmap
+                }
+            }
+        } finally {
+            if (shouldRecycleWorkingBitmap && !workingBitmap.isRecycled) {
+                workingBitmap.recycle()
+            }
+        }
+    }
+
+    private fun Bitmap.scaledToMaxDimension(maxDimension: Int): Bitmap {
+        val largestDimension = max(width, height)
+        if (largestDimension <= maxDimension) return this
+
+        val scale = maxDimension.toFloat() / largestDimension.toFloat()
+        val scaledWidth = (width * scale).roundToInt().coerceAtLeast(1)
+        val scaledHeight = (height * scale).roundToInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(this, scaledWidth, scaledHeight, true)
+    }
+
+    private fun Bitmap.compressJpeg(quality: Int): ByteArray {
+        return ByteArrayOutputStream().use { output ->
+            compress(Bitmap.CompressFormat.JPEG, quality, output)
+            output.toByteArray()
+        }
+    }
+}
+
+private fun CapturedText.toSuggestionImage(): SuggestionImage? {
+    val mimeType = imageMimeType ?: return null
+    val base64 = imageBase64 ?: return null
+    return SuggestionImage(mimeType = mimeType, base64 = base64)
 }
 
 object TextCleaner {
@@ -340,16 +645,25 @@ fun ReplyAssistantScreen(
     backendUrl: String,
     sourceApp: String,
     tone: String,
+    floatingControlEnabled: Boolean,
+    overlayPermissionGranted: Boolean,
+    burstCount: String,
+    burstIntervalMs: String,
     captures: List<CapturedText>,
     contextDraft: String,
     suggestions: List<String>,
     onBackendUrlChange: (String) -> Unit,
     onSourceAppChange: (String) -> Unit,
     onToneChange: (String) -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onFloatingControlChange: (Boolean) -> Unit,
+    onBurstCountChange: (String) -> Unit,
+    onBurstIntervalMsChange: (String) -> Unit,
     onContextChange: (String) -> Unit,
     onStartCapture: () -> Unit,
     onCaptureScreen: () -> Unit,
     onCaptureAfterDelay: () -> Unit,
+    onCaptureBurst: () -> Unit,
     onStopCapture: () -> Unit,
     onGenerate: () -> Unit,
     onRemoveCapture: (Long) -> Unit
@@ -375,6 +689,22 @@ fun ReplyAssistantScreen(
                     onCaptureScreen = onCaptureScreen,
                     onCaptureAfterDelay = onCaptureAfterDelay,
                     onStopCapture = onStopCapture
+                )
+            }
+
+            item {
+                FloatingCaptureControls(
+                    captureActive = captureActive,
+                    overlayPermissionGranted = overlayPermissionGranted,
+                    floatingControlEnabled = floatingControlEnabled,
+                    burstCount = burstCount,
+                    burstIntervalMs = burstIntervalMs,
+                    isBusy = isBusy,
+                    onRequestOverlayPermission = onRequestOverlayPermission,
+                    onFloatingControlChange = onFloatingControlChange,
+                    onBurstCountChange = onBurstCountChange,
+                    onBurstIntervalMsChange = onBurstIntervalMsChange,
+                    onCaptureBurst = onCaptureBurst
                 )
             }
 
@@ -406,7 +736,7 @@ fun ReplyAssistantScreen(
                     onValueChange = onContextChange,
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 7,
-                    label = { Text("Text sent to the backend") }
+                    label = { Text("Text sent with screenshots") }
                 )
             }
 
@@ -502,6 +832,69 @@ private fun CaptureControls(
 }
 
 @Composable
+private fun FloatingCaptureControls(
+    captureActive: Boolean,
+    overlayPermissionGranted: Boolean,
+    floatingControlEnabled: Boolean,
+    burstCount: String,
+    burstIntervalMs: String,
+    isBusy: Boolean,
+    onRequestOverlayPermission: () -> Unit,
+    onFloatingControlChange: (Boolean) -> Unit,
+    onBurstCountChange: (String) -> Unit,
+    onBurstIntervalMsChange: (String) -> Unit,
+    onCaptureBurst: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SectionTitle("Floating Capture")
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = onRequestOverlayPermission,
+                modifier = Modifier.weight(1f),
+                enabled = !overlayPermissionGranted && !isBusy
+            ) {
+                Text(if (overlayPermissionGranted) "Overlay Allowed" else "Allow Overlay")
+            }
+            Button(
+                onClick = { onFloatingControlChange(!floatingControlEnabled) },
+                modifier = Modifier.weight(1f),
+                enabled = captureActive && overlayPermissionGranted && !isBusy
+            ) {
+                Text(if (floatingControlEnabled) "Hide Floating" else "Show Floating")
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = burstCount,
+                onValueChange = onBurstCountChange,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Shots") },
+                placeholder = { Text("3") }
+            )
+            OutlinedTextField(
+                value = burstIntervalMs,
+                onValueChange = onBurstIntervalMsChange,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Interval ms") },
+                placeholder = { Text("1200") }
+            )
+        }
+
+        OutlinedButton(
+            onClick = onCaptureBurst,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = captureActive && !isBusy
+        ) {
+            Text("Capture Burst + Generate")
+        }
+    }
+}
+
+@Composable
 private fun SettingsFields(
     backendUrl: String,
     sourceApp: String,
@@ -517,7 +910,7 @@ private fun SettingsFields(
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             label = { Text("Backend URL") },
-            placeholder = { Text("http://192.168.1.42:3000/suggest") }
+            placeholder = { Text("Set BACKEND_URL in .env or enter URL") }
         )
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(

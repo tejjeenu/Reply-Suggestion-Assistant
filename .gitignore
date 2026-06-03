@@ -2,9 +2,12 @@
 .idea/
 build/
 local.properties
+.env
+.venv/
 captures/
 *.iml
 
 app/build/
 backend/.env
+backend/.venv/
 node_modules/

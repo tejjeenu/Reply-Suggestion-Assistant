@@ -11,19 +11,43 @@ import java.net.URL
 data class SuggestionRequest(
     val sourceApp: String,
     val tone: String,
-    val contextText: String
+    val contextText: String,
+    val images: List<SuggestionImage> = emptyList()
+)
+
+data class SuggestionImage(
+    val mimeType: String,
+    val base64: String
 )
 
 object SuggestionApi {
+    fun normalizeSuggestEndpoint(endpoint: String): String {
+        val trimmed = endpoint.trim()
+        if (trimmed.isBlank()) return ""
+
+        val suffixStart = listOf(trimmed.indexOf('?'), trimmed.indexOf('#'))
+            .filter { it >= 0 }
+            .minOrNull() ?: trimmed.length
+        val base = trimmed.substring(0, suffixStart).trimEnd('/')
+        val suffix = trimmed.substring(suffixStart)
+
+        return if (base.endsWith("/suggest")) {
+            "$base$suffix"
+        } else {
+            "$base/suggest$suffix"
+        }
+    }
+
     suspend fun suggestReplies(
         endpoint: String,
         request: SuggestionRequest
     ): List<String> = withContext(Dispatchers.IO) {
-        if (endpoint.isBlank()) {
+        val normalizedEndpoint = normalizeSuggestEndpoint(endpoint)
+        if (normalizedEndpoint.isBlank()) {
             return@withContext localSuggestions(request.contextText)
         }
 
-        val connection = URL(endpoint).openConnection() as HttpURLConnection
+        val connection = URL(normalizedEndpoint).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "POST"
             connection.connectTimeout = 15_000
@@ -36,6 +60,18 @@ object SuggestionApi {
                 .put("source_app", request.sourceApp)
                 .put("tone", request.tone)
                 .put("context_text", request.contextText)
+
+            if (request.images.isNotEmpty()) {
+                val images = JSONArray()
+                request.images.take(5).forEach { image ->
+                    images.put(
+                        JSONObject()
+                            .put("mime_type", image.mimeType)
+                            .put("base64", image.base64)
+                    )
+                }
+                payload.put("images", images)
+            }
 
             connection.outputStream.use { output ->
                 output.write(payload.toString().toByteArray(Charsets.UTF_8))
