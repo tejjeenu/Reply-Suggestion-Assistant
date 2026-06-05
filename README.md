@@ -8,7 +8,8 @@ Android MVP for capturing user-approved screen context, extracting text with Goo
 - User-approved `MediaProjection` screen capture session.
 - Foreground screen capture service with Android media projection service type.
 - Multiple manual screenshot captures per session.
-- Optional floating capture control shown over other apps after explicit overlay permission.
+- Optional floating capture panel shown over other apps after explicit overlay permission.
+- Floating panel workflow for collecting screenshots, processing them, copying replies, and viewing results without returning to the main app.
 - Timed burst capture for collecting multiple screenshots while navigating a conversation.
 - On-device ML Kit OCR for each screenshot.
 - Optional multimodal Groq/Llama 4 Scout analysis of the screenshot image plus OCR text, including visible image details like appearance, objects, activity, setting, and mood.
@@ -57,12 +58,16 @@ The app will install as `Reply Assistant`.
 
 1. Tap `Start Capture`.
 2. Approve Android's screen capture prompt.
-3. Use `Capture Current Screen`, `Capture After 5 Seconds`, or `Capture Burst + Generate`.
+3. Use `Capture Current Screen`, `Capture After 5 Seconds`, or `Capture Burst + Generate` from the main app when you want the old in-app flow.
 4. For the floating workflow, tap `Allow Overlay`, grant display-over-other-apps permission, then tap `Show Floating`.
-5. Switch to the target app and tap the floating `RA` control to capture a timed burst and generate suggestions.
-6. Review or edit the extracted OCR text when you return to Reply Assistant.
+5. Switch to the target app and use the floating panel:
+   - `Shot` collects one screenshot.
+   - `Burst` collects the configured timed set and generates replies.
+   - `Replies` processes the screenshots already collected in the panel.
+   - `Clear` resets the panel context.
+6. The panel briefly hides while screenshots are captured so it does not capture itself, then reappears with progress, collected image summaries, generated replies, and `Copy` buttons.
 7. Leave `Backend URL` blank for mock suggestions, or set it to your backend.
-8. Tap `Generate Replies` again if you edit the context.
+8. You can still review or edit extracted OCR text in the main app if you want to refine the context manually.
 
 ## Backend Setup
 
@@ -159,7 +164,7 @@ Your phone and computer must be on the same Wi-Fi. The Android manifest allows c
 
 ## Current Limitations
 
-- The floating control is user-triggered. It does not automatically detect messaging apps.
+- The floating panel is user-triggered. It does not automatically detect messaging apps.
 - Automatic foreground-app detection would need an additional, carefully justified accessibility or usage-access design.
 - Some protected screens may capture as black because Android apps can block screen capture.
 - ML Kit OCR extracts text locally; when a Groq backend URL is configured, the backend also sends a compressed screenshot image to Llama 4 Scout for visual context such as photos, shared images, objects, activities, and scene details.

@@ -98,7 +98,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (!granted) {
-            statusMessage = "Notification permission denied. Screen capture may still run, but Android can limit foreground service visibility."
+            updateStatus("Notification permission denied. Screen capture may still run, but Android can limit foreground service visibility.")
         }
     }
 
@@ -108,7 +108,7 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startCaptureService(result.resultCode, result.data!!)
         } else {
-            statusMessage = "Screen capture permission cancelled."
+            updateStatus("Screen capture permission cancelled.")
         }
     }
 
@@ -119,10 +119,11 @@ class MainActivity : ComponentActivity() {
             service.setOverlayListener(overlayListener)
             isBound = true
             captureActive = true
+            syncFloatingPanelState()
             if (floatingControlEnabled) {
                 showFloatingControlIfPossible(service)
             } else {
-                statusMessage = "Capture session ready."
+                updateStatus("Capture session ready.")
             }
         }
 
@@ -131,14 +132,40 @@ class MainActivity : ComponentActivity() {
             captureService = null
             isBound = false
             captureActive = false
-            statusMessage = "Capture service disconnected."
+            updateStatus("Capture service disconnected.")
         }
     }
 
     private val overlayListener = object : CaptureService.OverlayListener {
-        override fun onFloatingCaptureRequested() {
+        override fun onOverlayCaptureRequested() {
+            runOnUiThread {
+                captureAndRunOcr(fromFloatingControl = true)
+            }
+        }
+
+        override fun onOverlayBurstRequested() {
             runOnUiThread {
                 captureBurstAndGenerate(fromFloatingControl = true)
+            }
+        }
+
+        override fun onOverlayGenerateRequested() {
+            runOnUiThread {
+                generateSuggestions(fromFloatingPanel = true)
+            }
+        }
+
+        override fun onOverlayClearRequested() {
+            runOnUiThread {
+                clearFloatingPanelContext()
+            }
+        }
+
+        override fun onOverlayClosed() {
+            runOnUiThread {
+                floatingControlEnabled = false
+                captureService?.hideFloatingControl()
+                updateStatus("Floating panel hidden.")
             }
         }
     }
@@ -174,11 +201,11 @@ class MainActivity : ComponentActivity() {
                     onBurstIntervalMsChange = { burstIntervalMsText = it.filter { char -> char.isDigit() }.take(5) },
                     onContextChange = { contextDraft = it },
                     onStartCapture = ::requestScreenCapture,
-                    onCaptureScreen = ::captureAndRunOcr,
+                    onCaptureScreen = { captureAndRunOcr() },
                     onCaptureAfterDelay = ::captureAfterDelay,
                     onCaptureBurst = { captureBurstAndGenerate(fromFloatingControl = false) },
                     onStopCapture = ::stopCapture,
-                    onGenerate = ::generateSuggestions,
+                    onGenerate = { generateSuggestions() },
                     onRemoveCapture = ::removeCapture
                 )
             }
@@ -221,7 +248,7 @@ class MainActivity : ComponentActivity() {
     private fun requestOverlayPermission() {
         if (canDrawOverlays()) {
             overlayPermissionGranted = true
-            statusMessage = "Floating control permission is already enabled."
+            updateStatus("Floating panel permission is already enabled.")
             return
         }
 
@@ -230,7 +257,7 @@ class MainActivity : ComponentActivity() {
             Uri.parse("package:$packageName")
         )
         startActivity(intent)
-        statusMessage = "Enable display-over-other-apps permission, then return to Reply Assistant."
+        updateStatus("Enable display-over-other-apps permission, then return to Reply Assistant.")
     }
 
     private fun updateFloatingControlEnabled(enabled: Boolean) {
@@ -245,28 +272,29 @@ class MainActivity : ComponentActivity() {
         if (enabled) {
             val service = captureService
             if (service == null || !isBound) {
-                statusMessage = "Start a capture session before showing the floating control."
+                updateStatus("Start a capture session before showing the floating panel.")
                 return
             }
             showFloatingControlIfPossible(service)
         } else {
             captureService?.hideFloatingControl()
-            statusMessage = "Floating control hidden."
+            updateStatus("Floating panel hidden.")
         }
     }
 
     private fun showFloatingControlIfPossible(service: CaptureService) {
         refreshOverlayPermissionStatus()
         if (!overlayPermissionGranted) {
-            statusMessage = "Overlay permission is needed for the floating control."
+            updateStatus("Overlay permission is needed for the floating panel.")
             return
         }
 
-        statusMessage = if (service.showFloatingControl()) {
-            "Floating control ready. Tap it over another app to capture a burst and generate replies."
+        updateStatus(if (service.showFloatingControl()) {
+            "Floating panel ready."
         } else {
-            "Floating control could not be shown. Check overlay permission."
-        }
+            "Floating panel could not be shown. Check overlay permission."
+        })
+        syncFloatingPanelState()
     }
 
     private fun requestScreenCapture() {
@@ -286,7 +314,7 @@ class MainActivity : ComponentActivity() {
         }
 
         bindService(Intent(this, CaptureService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
-        statusMessage = "Starting capture service..."
+        updateStatus("Starting capture service...")
     }
 
     private fun stopCapture() {
@@ -300,21 +328,28 @@ class MainActivity : ComponentActivity() {
         captureActive = false
         floatingControlEnabled = false
         stopService(Intent(this, CaptureService::class.java))
-        statusMessage = "Capture session stopped."
+        updateStatus("Capture session stopped.")
     }
 
-    private fun captureAndRunOcr() {
+    private fun captureAndRunOcr(fromFloatingControl: Boolean = false) {
         if (!isBound || captureService == null) {
-            statusMessage = "Start a capture session first."
+            updateStatus("Start a capture session first.")
             return
         }
 
-        isBusy = true
-        statusMessage = "Capturing screen..."
+        val shouldRestoreFloatingControl = fromFloatingControl && floatingControlEnabled
+
+        updateBusy(true)
+        updateStatus("Capturing screen...")
 
         lifecycleScope.launch {
+            if (shouldRestoreFloatingControl) {
+                captureService?.hideFloatingControl()
+                delay(250)
+            }
+
             val result = captureAndStoreScreenshot()
-            statusMessage = result.fold(
+            updateStatus(result.fold(
                 onSuccess = { hadText ->
                     if (hadText) {
                         "Captured and extracted text."
@@ -323,19 +358,20 @@ class MainActivity : ComponentActivity() {
                     }
                 },
                 onFailure = { error -> "Capture failed: ${error.message}" }
-            )
-            isBusy = false
+            ))
+            updateBusy(false)
+            restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
         }
     }
 
     private fun captureBurstAndGenerate(fromFloatingControl: Boolean) {
         if (!isBound || captureService == null) {
-            statusMessage = "Start a capture session first."
+            updateStatus("Start a capture session first.")
             return
         }
 
         if (isBusy) {
-            statusMessage = "Reply Assistant is already working."
+            updateStatus("Reply Assistant is already working.")
             return
         }
 
@@ -343,21 +379,23 @@ class MainActivity : ComponentActivity() {
         val intervalMs = normalizedBurstIntervalMs()
         val shouldRestoreFloatingControl = fromFloatingControl && floatingControlEnabled
 
-        isBusy = true
-        suggestions = emptyList()
+        updateBusy(true)
+        updateSuggestions(emptyList())
 
         lifecycleScope.launch {
-            if (shouldRestoreFloatingControl) {
-                captureService?.hideFloatingControl()
-                delay(250)
-            }
-
             var capturedCount = 0
             var lastError: Throwable? = null
 
             for (index in 1..count) {
-                statusMessage = "Capturing screenshot $index of $count..."
+                updateStatus("Capturing screenshot $index of $count...")
+                if (shouldRestoreFloatingControl) {
+                    captureService?.hideFloatingControl()
+                    delay(250)
+                }
+
                 val result = captureAndStoreScreenshot()
+                restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
+
                 if (result.isSuccess) {
                     capturedCount += 1
                 } else {
@@ -365,32 +403,32 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (index < count) {
-                    statusMessage = "Move to the next relevant screen. Next capture in ${intervalMs}ms."
+                    updateStatus("Move to the next relevant screen. Next capture in ${intervalMs}ms.")
                     delay(intervalMs.toLong())
                 }
             }
 
             if (capturedCount == 0) {
-                statusMessage = "Burst capture failed: ${lastError?.message ?: "No screenshots captured."}"
-                isBusy = false
-                if (shouldRestoreFloatingControl) captureService?.let(::showFloatingControlIfPossible)
+                updateStatus("Burst capture failed: ${lastError?.message ?: "No screenshots captured."}")
+                updateBusy(false)
+                restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
                 return@launch
             }
 
-            statusMessage = "Captured $capturedCount screenshot${if (capturedCount == 1) "" else "s"}. Generating replies..."
+            updateStatus("Captured $capturedCount screenshot${if (capturedCount == 1) "" else "s"}. Generating replies...")
             val suggestionResult = requestSuggestions()
 
-            suggestions = suggestionResult.getOrElse { error ->
-                statusMessage = "Suggestion request failed: ${error.message}"
+            updateSuggestions(suggestionResult.getOrElse { error ->
+                updateStatus("Suggestion request failed: ${error.message}")
                 emptyList()
-            }
+            })
 
             if (suggestions.isNotEmpty()) {
-                statusMessage = "Suggestions ready."
+                updateStatus("Suggestions ready.")
             }
 
-            isBusy = false
-            if (shouldRestoreFloatingControl) captureService?.let(::showFloatingControlIfPossible)
+            updateBusy(false)
+            restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
         }
     }
 
@@ -405,7 +443,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     result
                         .onSuccess { bitmap ->
-                            statusMessage = "Running OCR..."
+                            updateStatus("Running OCR...")
                             ocrProcessor.extractText(
                                 bitmap = bitmap,
                                 onSuccess = { rawText ->
@@ -422,7 +460,8 @@ class MainActivity : ComponentActivity() {
                                     )
                                     captures.add(capture)
                                     contextDraft = buildContextDraft()
-                                    suggestions = emptyList()
+                                    updateSuggestions(emptyList())
+                                    syncFloatingPanelState()
 
                                     if (continuation.isActive) {
                                         continuation.resume(Result.success(cleanedText.isNotBlank()))
@@ -448,12 +487,12 @@ class MainActivity : ComponentActivity() {
 
     private fun captureAfterDelay() {
         if (!isBound || captureService == null) {
-            statusMessage = "Start a capture session first."
+            updateStatus("Start a capture session first.")
             return
         }
 
-        isBusy = true
-        statusMessage = "Switch to the target screen. Capture starts in 5 seconds."
+        updateBusy(true)
+        updateStatus("Switch to the target screen. Capture starts in 5 seconds.")
         moveTaskToBack(true)
 
         lifecycleScope.launch {
@@ -462,27 +501,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun generateSuggestions() {
+    private fun generateSuggestions(fromFloatingPanel: Boolean = false) {
         if (contextDraft.trim().isBlank()) {
-            statusMessage = "Capture or enter some context first."
+            updateStatus("Capture or enter some context first.")
             return
         }
 
-        isBusy = true
-        statusMessage = "Generating replies..."
+        updateBusy(true)
+        updateStatus(if (fromFloatingPanel) "Processing collected images..." else "Generating replies...")
 
         lifecycleScope.launch {
             val result = requestSuggestions()
 
-            suggestions = result.getOrElse { error ->
-                statusMessage = "Suggestion request failed: ${error.message}"
+            updateSuggestions(result.getOrElse { error ->
+                updateStatus("Suggestion request failed: ${error.message}")
                 emptyList()
-            }
+            })
 
             if (suggestions.isNotEmpty()) {
-                statusMessage = "Suggestions ready."
+                updateStatus("Suggestions ready.")
             }
-            isBusy = false
+            updateBusy(false)
         }
     }
 
@@ -516,13 +555,63 @@ class MainActivity : ComponentActivity() {
     private fun removeCapture(id: Long) {
         captures.removeAll { it.id == id }
         contextDraft = buildContextDraft()
-        suggestions = emptyList()
+        updateSuggestions(emptyList())
+        syncFloatingPanelState()
+    }
+
+    private fun clearFloatingPanelContext() {
+        captures.clear()
+        contextDraft = ""
+        updateSuggestions(emptyList())
+        updateStatus("Floating panel cleared.")
     }
 
     private fun buildContextDraft(): String {
         return captures.joinToString(separator = "\n\n") { capture ->
             "[${capture.title}]\n${capture.text}"
         }
+    }
+
+    private fun updateStatus(message: String) {
+        statusMessage = message
+        syncFloatingPanelState()
+    }
+
+    private fun updateBusy(value: Boolean) {
+        isBusy = value
+        syncFloatingPanelState()
+    }
+
+    private fun updateSuggestions(nextSuggestions: List<String>) {
+        suggestions = nextSuggestions
+        syncFloatingPanelState()
+    }
+
+    private fun restoreFloatingControlIfNeeded(shouldRestore: Boolean) {
+        if (!shouldRestore) return
+        val service = captureService ?: return
+        if (service.showFloatingControl()) {
+            syncFloatingPanelState()
+        } else {
+            updateStatus("Floating panel could not be restored. Check overlay permission.")
+        }
+    }
+
+    private fun syncFloatingPanelState() {
+        captureService?.updateFloatingPanelState(
+            CaptureService.FloatingPanelState(
+                statusMessage = statusMessage,
+                isBusy = isBusy,
+                captures = captures.map { capture ->
+                    CaptureService.FloatingCaptureSummary(
+                        id = capture.id,
+                        title = capture.title,
+                        previewText = capture.text
+                    )
+                },
+                suggestions = suggestions
+            )
+        )
     }
 }
 

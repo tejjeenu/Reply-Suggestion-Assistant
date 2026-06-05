@@ -4,11 +4,14 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -20,16 +23,26 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import java.io.IOException
+import kotlin.math.abs
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class CaptureService : Service() {
     private val binder = LocalBinder()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -39,6 +52,8 @@ class CaptureService : Service() {
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private var overlayListener: OverlayListener? = null
+    private var floatingPanelExpanded = true
+    private var floatingPanelState = FloatingPanelState()
 
     @Volatile
     private var projectionReady = false
@@ -79,48 +94,31 @@ class CaptureService : Service() {
         overlayListener = listener
     }
 
+    fun updateFloatingPanelState(state: FloatingPanelState) {
+        floatingPanelState = state
+        mainHandler.post {
+            if (overlayView != null) {
+                renderFloatingControl()
+            }
+        }
+    }
+
     fun showFloatingControl(): Boolean {
-        if (overlayView != null) return true
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             return false
         }
 
-        val manager = getSystemService(WindowManager::class.java)
-        windowManager = manager
-
-        val control = TextView(this).apply {
-            text = "RA"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(24, 96, 168))
-            gravity = Gravity.CENTER
-            elevation = 12f
-            contentDescription = "Reply Assistant capture"
-            setOnTouchListener(FloatingControlTouchListener())
+        windowManager = getSystemService(WindowManager::class.java)
+        mainHandler.post {
+            renderFloatingControl()
         }
-
-        val params = WindowManager.LayoutParams(
-            FLOATING_CONTROL_SIZE_PX,
-            FLOATING_CONTROL_SIZE_PX,
-            overlayWindowType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = FLOATING_CONTROL_INITIAL_X
-            y = FLOATING_CONTROL_INITIAL_Y
-        }
-
-        manager.addView(control, params)
-        overlayView = control
         return true
     }
 
     fun hideFloatingControl() {
-        val view = overlayView ?: return
-        runCatching { windowManager?.removeView(view) }
-        overlayView = null
+        mainHandler.post {
+            removeOverlayView()
+        }
     }
 
     override fun onDestroy() {
@@ -236,6 +234,454 @@ class CaptureService : Service() {
         }
     }
 
+    private fun renderFloatingControl() {
+        val manager = windowManager ?: getSystemService(WindowManager::class.java).also {
+            windowManager = it
+        }
+        val previousParams = overlayView?.layoutParams as? WindowManager.LayoutParams
+        val x = previousParams?.x ?: FLOATING_CONTROL_INITIAL_X
+        val y = previousParams?.y ?: FLOATING_CONTROL_INITIAL_Y
+
+        removeOverlayView()
+
+        val nextView = if (floatingPanelExpanded) {
+            buildExpandedPanelView()
+        } else {
+            buildCompactTileView()
+        }
+
+        val nextParams = if (floatingPanelExpanded) {
+            expandedPanelParams(x = x, y = y)
+        } else {
+            compactTileParams(x = x, y = y)
+        }
+
+        runCatching {
+            manager.addView(nextView, nextParams)
+            overlayView = nextView
+        }
+    }
+
+    private fun removeOverlayView() {
+        val view = overlayView ?: return
+        runCatching { windowManager?.removeView(view) }
+        overlayView = null
+    }
+
+    private fun buildCompactTileView(): View {
+        val captureCount = floatingPanelState.captures.size
+        val replyCount = floatingPanelState.suggestions.size
+        val countText = when {
+            replyCount > 0 -> replyCount.toString()
+            captureCount > 0 -> captureCount.toString()
+            else -> ""
+        }
+
+        return TextView(this).apply {
+            text = if (countText.isBlank()) "RA" else "RA\n$countText"
+            textSize = if (countText.isBlank()) 15f else 13f
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            background = roundedDrawable(
+                color = PANEL_ACCENT,
+                strokeColor = Color.rgb(12, 70, 132),
+                radiusDp = 8
+            )
+            elevation = 12f
+            contentDescription = "Reply Assistant panel"
+            setOnTouchListener(
+                FloatingOverlayTouchListener {
+                    floatingPanelExpanded = true
+                    renderFloatingControl()
+                }
+            )
+        }
+    }
+
+    private fun buildExpandedPanelView(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(10.dp(), 10.dp(), 10.dp(), 10.dp())
+            background = roundedDrawable(
+                color = Color.WHITE,
+                strokeColor = Color.rgb(194, 204, 216),
+                radiusDp = 8
+            )
+            elevation = 16f
+        }
+
+        root.addView(buildPanelHeader())
+        root.addView(buildStatusView())
+        root.addView(buildActionRows())
+        root.addView(buildPanelScrollContent())
+        return root
+    }
+
+    private fun buildPanelHeader(): View {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 6.dp())
+            setOnTouchListener(FloatingOverlayTouchListener())
+        }
+
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        titleColumn.addView(
+            TextView(this).apply {
+                text = "Reply Assistant"
+                textSize = 15f
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(PANEL_TEXT)
+                includeFontPadding = false
+            }
+        )
+        titleColumn.addView(
+            TextView(this).apply {
+                text = "${floatingPanelState.captures.size} images"
+                textSize = 11f
+                setTextColor(PANEL_MUTED_TEXT)
+                includeFontPadding = false
+            }
+        )
+
+        header.addView(titleColumn)
+        header.addView(
+            headerButton("Min") {
+                floatingPanelExpanded = false
+                renderFloatingControl()
+            }
+        )
+        header.addView(
+            headerButton("Close") {
+                val listener = overlayListener
+                if (listener == null) {
+                    hideFloatingControl()
+                } else {
+                    listener.onOverlayClosed()
+                }
+            }
+        )
+
+        return header
+    }
+
+    private fun buildStatusView(): View {
+        return TextView(this).apply {
+            text = floatingPanelState.statusMessage
+            textSize = 12f
+            setTextColor(PANEL_TEXT)
+            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
+            maxLines = 3
+            ellipsize = TextUtils.TruncateAt.END
+            background = roundedDrawable(
+                color = if (floatingPanelState.isBusy) Color.rgb(232, 241, 255) else Color.rgb(244, 247, 250),
+                strokeColor = if (floatingPanelState.isBusy) Color.rgb(159, 190, 236) else Color.rgb(224, 230, 238),
+                radiusDp = 8
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 8.dp()
+            }
+        }
+    }
+
+    private fun buildActionRows(): View {
+        val rows = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 8.dp()
+            }
+        }
+
+        rows.addView(
+            actionRow(
+                actionButton("Shot", enabled = !floatingPanelState.isBusy) {
+                    overlayListener?.onOverlayCaptureRequested()
+                },
+                actionButton("Burst", enabled = !floatingPanelState.isBusy) {
+                    overlayListener?.onOverlayBurstRequested()
+                }
+            )
+        )
+        rows.addView(
+            actionRow(
+                actionButton(
+                    label = "Replies",
+                    enabled = !floatingPanelState.isBusy && floatingPanelState.captures.isNotEmpty()
+                ) {
+                    overlayListener?.onOverlayGenerateRequested()
+                },
+                actionButton(
+                    label = "Clear",
+                    enabled = !floatingPanelState.isBusy &&
+                        (floatingPanelState.captures.isNotEmpty() || floatingPanelState.suggestions.isNotEmpty())
+                ) {
+                    overlayListener?.onOverlayClearRequested()
+                }
+            )
+        )
+
+        return rows
+    }
+
+    private fun actionRow(left: View, right: View): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(left)
+            addView(right)
+        }
+    }
+
+    private fun buildPanelScrollContent(): View {
+        val scroll = ScrollView(this).apply {
+            isFillViewport = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        content.addView(sectionTitle("Images"))
+        if (floatingPanelState.captures.isEmpty()) {
+            content.addView(emptyText("No images collected yet."))
+        } else {
+            floatingPanelState.captures.takeLast(MAX_CAPTURE_SUMMARIES).forEach { capture ->
+                content.addView(captureSummaryCard(capture))
+            }
+        }
+
+        content.addView(sectionTitle("Replies"))
+        if (floatingPanelState.suggestions.isEmpty()) {
+            content.addView(emptyText("Replies will appear here."))
+        } else {
+            floatingPanelState.suggestions.forEach { suggestion ->
+                content.addView(suggestionCard(suggestion))
+            }
+        }
+
+        scroll.addView(content)
+        return scroll
+    }
+
+    private fun captureSummaryCard(capture: FloatingCaptureSummary): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
+            background = roundedDrawable(
+                color = Color.rgb(248, 250, 252),
+                strokeColor = Color.rgb(229, 234, 240),
+                radiusDp = 8
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 6.dp()
+            }
+
+            addView(
+                TextView(context).apply {
+                    text = capture.title
+                    textSize = 12f
+                    setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                    setTextColor(PANEL_TEXT)
+                    includeFontPadding = false
+                }
+            )
+            addView(
+                TextView(context).apply {
+                    text = capture.previewText.ifBlank { "Image captured." }
+                    textSize = 11f
+                    setTextColor(PANEL_MUTED_TEXT)
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                }
+            )
+        }
+    }
+
+    private fun suggestionCard(suggestion: String): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
+            background = roundedDrawable(
+                color = Color.rgb(246, 250, 247),
+                strokeColor = Color.rgb(203, 226, 210),
+                radiusDp = 8
+            )
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = 7.dp()
+            }
+        }
+
+        card.addView(
+            TextView(this).apply {
+                text = suggestion
+                textSize = 13f
+                setTextColor(PANEL_TEXT)
+                maxLines = 4
+                ellipsize = TextUtils.TruncateAt.END
+            }
+        )
+        card.addView(
+            Button(this).apply {
+                text = "Copy"
+                textSize = 11f
+                setAllCaps(false)
+                minHeight = 0
+                minimumHeight = 0
+                setPadding(8.dp(), 0, 8.dp(), 0)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    32.dp()
+                ).apply {
+                    gravity = Gravity.END
+                    topMargin = 4.dp()
+                }
+                setOnClickListener {
+                    copySuggestion(suggestion)
+                }
+            }
+        )
+
+        return card
+    }
+
+    private fun copySuggestion(suggestion: String) {
+        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("Reply suggestion", suggestion))
+        floatingPanelState = floatingPanelState.copy(statusMessage = "Copied reply.")
+        renderFloatingControl()
+    }
+
+    private fun sectionTitle(title: String): View {
+        return TextView(this).apply {
+            text = title
+            textSize = 12f
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(PANEL_TEXT)
+            setPadding(0, 6.dp(), 0, 5.dp())
+        }
+    }
+
+    private fun emptyText(textValue: String): View {
+        return TextView(this).apply {
+            text = textValue
+            textSize = 11f
+            setTextColor(PANEL_MUTED_TEXT)
+            setPadding(8.dp(), 6.dp(), 8.dp(), 8.dp())
+        }
+    }
+
+    private fun headerButton(label: String, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 11f
+            setAllCaps(false)
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(8.dp(), 0, 8.dp(), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                32.dp()
+            ).apply {
+                leftMargin = 5.dp()
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun actionButton(label: String, enabled: Boolean, onClick: () -> Unit): Button {
+        return Button(this).apply {
+            text = label
+            textSize = 12f
+            setAllCaps(false)
+            isEnabled = enabled
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(4.dp(), 0, 4.dp(), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                38.dp(),
+                1f
+            ).apply {
+                leftMargin = 3.dp()
+                rightMargin = 3.dp()
+                bottomMargin = 6.dp()
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun expandedPanelParams(x: Int, y: Int): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            panelWidthPx(),
+            panelHeightPx(),
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y
+        }
+    }
+
+    private fun compactTileParams(x: Int, y: Int): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            FLOATING_CONTROL_SIZE_PX,
+            FLOATING_CONTROL_SIZE_PX,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y
+        }
+    }
+
+    private fun panelWidthPx(): Int {
+        val availableWidth = resources.displayMetrics.widthPixels - 24.dp()
+        return min(PANEL_WIDTH_DP.dp(), availableWidth).coerceAtLeast(280.dp())
+    }
+
+    private fun panelHeightPx(): Int {
+        val availableHeight = resources.displayMetrics.heightPixels - 72.dp()
+        return min(PANEL_HEIGHT_DP.dp(), availableHeight).coerceAtLeast(360.dp())
+    }
+
+    private fun roundedDrawable(color: Int, strokeColor: Int, radiusDp: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            cornerRadius = radiusDp.dp().toFloat()
+            setStroke(1.dp(), strokeColor)
+        }
+    }
+
     private fun currentDisplayMetrics() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         val windowManager = getSystemService(WindowManager::class.java)
         val bounds = windowManager.maximumWindowMetrics.bounds
@@ -291,16 +737,39 @@ class CaptureService : Service() {
         notificationManager.createNotificationChannel(channel)
     }
 
+    private fun Int.dp(): Int {
+        return (this * resources.displayMetrics.density).roundToInt()
+    }
+
     inner class LocalBinder : Binder() {
         val service: CaptureService
             get() = this@CaptureService
     }
 
     interface OverlayListener {
-        fun onFloatingCaptureRequested()
+        fun onOverlayCaptureRequested()
+        fun onOverlayBurstRequested()
+        fun onOverlayGenerateRequested()
+        fun onOverlayClearRequested()
+        fun onOverlayClosed()
     }
 
-    private inner class FloatingControlTouchListener : View.OnTouchListener {
+    data class FloatingCaptureSummary(
+        val id: Long,
+        val title: String,
+        val previewText: String
+    )
+
+    data class FloatingPanelState(
+        val statusMessage: String = "Ready",
+        val isBusy: Boolean = false,
+        val captures: List<FloatingCaptureSummary> = emptyList(),
+        val suggestions: List<String> = emptyList()
+    )
+
+    private inner class FloatingOverlayTouchListener(
+        private val onClick: (() -> Unit)? = null
+    ) : View.OnTouchListener {
         private var initialX = 0
         private var initialY = 0
         private var initialTouchX = 0f
@@ -308,7 +777,7 @@ class CaptureService : Service() {
         private var moved = false
 
         override fun onTouch(view: View, event: MotionEvent): Boolean {
-            val params = view.layoutParams as WindowManager.LayoutParams
+            val params = overlayView?.layoutParams as? WindowManager.LayoutParams ?: return false
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -322,17 +791,19 @@ class CaptureService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - initialTouchX).toInt()
                     val dy = (event.rawY - initialTouchY).toInt()
-                    if (kotlin.math.abs(dx) > DRAG_SLOP_PX || kotlin.math.abs(dy) > DRAG_SLOP_PX) {
+                    if (abs(dx) > DRAG_SLOP_PX || abs(dy) > DRAG_SLOP_PX) {
                         moved = true
                     }
                     params.x = initialX + dx
                     params.y = initialY + dy
-                    windowManager?.updateViewLayout(view, params)
+                    overlayView?.let { activeView ->
+                        windowManager?.updateViewLayout(activeView, params)
+                    }
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!moved) {
-                        overlayListener?.onFloatingCaptureRequested()
+                        onClick?.invoke()
                     }
                     return true
                 }
@@ -356,6 +827,12 @@ class CaptureService : Service() {
         private const val FLOATING_CONTROL_INITIAL_X = 24
         private const val FLOATING_CONTROL_INITIAL_Y = 220
         private const val DRAG_SLOP_PX = 8
+        private const val MAX_CAPTURE_SUMMARIES = 5
+        private const val PANEL_WIDTH_DP = 340
+        private const val PANEL_HEIGHT_DP = 520
+        private val PANEL_ACCENT = Color.rgb(24, 96, 168)
+        private val PANEL_TEXT = Color.rgb(23, 33, 43)
+        private val PANEL_MUTED_TEXT = Color.rgb(89, 102, 116)
     }
 }
 
