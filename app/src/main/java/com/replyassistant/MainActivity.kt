@@ -31,7 +31,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -43,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -89,8 +90,6 @@ class MainActivity : ComponentActivity() {
     private var tone by mutableStateOf("casual, natural, helpful")
     private var floatingControlEnabled by mutableStateOf(false)
     private var overlayPermissionGranted by mutableStateOf(false)
-    private var burstCountText by mutableStateOf("3")
-    private var burstIntervalMsText by mutableStateOf("1200")
     private var contextDraft by mutableStateOf("")
     private var suggestions by mutableStateOf<List<String>>(emptyList())
 
@@ -143,12 +142,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        override fun onOverlayBurstRequested() {
-            runOnUiThread {
-                captureBurstAndGenerate(fromFloatingControl = true)
-            }
-        }
-
         override fun onOverlayGenerateRequested() {
             runOnUiThread {
                 generateSuggestions(fromFloatingPanel = true)
@@ -183,27 +176,20 @@ class MainActivity : ComponentActivity() {
                     isBusy = isBusy,
                     statusMessage = statusMessage,
                     backendUrl = backendUrl,
-                    sourceApp = sourceApp,
                     tone = tone,
                     floatingControlEnabled = floatingControlEnabled,
                     overlayPermissionGranted = overlayPermissionGranted,
-                    burstCount = burstCountText,
-                    burstIntervalMs = burstIntervalMsText,
                     captures = captures,
                     contextDraft = contextDraft,
                     suggestions = suggestions,
                     onBackendUrlChange = { backendUrl = it },
-                    onSourceAppChange = { sourceApp = it },
                     onToneChange = { tone = it },
                     onRequestOverlayPermission = ::requestOverlayPermission,
                     onFloatingControlChange = ::updateFloatingControlEnabled,
-                    onBurstCountChange = { burstCountText = it.filter { char -> char.isDigit() }.take(1) },
-                    onBurstIntervalMsChange = { burstIntervalMsText = it.filter { char -> char.isDigit() }.take(5) },
                     onContextChange = { contextDraft = it },
                     onStartCapture = ::requestScreenCapture,
                     onCaptureScreen = { captureAndRunOcr() },
                     onCaptureAfterDelay = ::captureAfterDelay,
-                    onCaptureBurst = { captureBurstAndGenerate(fromFloatingControl = false) },
                     onStopCapture = ::stopCapture,
                     onGenerate = { generateSuggestions() },
                     onRemoveCapture = ::removeCapture
@@ -364,74 +350,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun captureBurstAndGenerate(fromFloatingControl: Boolean) {
-        if (!isBound || captureService == null) {
-            updateStatus("Start a capture session first.")
-            return
-        }
-
-        if (isBusy) {
-            updateStatus("Reply Assistant is already working.")
-            return
-        }
-
-        val count = normalizedBurstCount()
-        val intervalMs = normalizedBurstIntervalMs()
-        val shouldRestoreFloatingControl = fromFloatingControl && floatingControlEnabled
-
-        updateBusy(true)
-        updateSuggestions(emptyList())
-
-        lifecycleScope.launch {
-            var capturedCount = 0
-            var lastError: Throwable? = null
-
-            for (index in 1..count) {
-                updateStatus("Capturing screenshot $index of $count...")
-                if (shouldRestoreFloatingControl) {
-                    captureService?.hideFloatingControl()
-                    delay(250)
-                }
-
-                val result = captureAndStoreScreenshot()
-                restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
-
-                if (result.isSuccess) {
-                    capturedCount += 1
-                } else {
-                    lastError = result.exceptionOrNull()
-                }
-
-                if (index < count) {
-                    updateStatus("Move to the next relevant screen. Next capture in ${intervalMs}ms.")
-                    delay(intervalMs.toLong())
-                }
-            }
-
-            if (capturedCount == 0) {
-                updateStatus("Burst capture failed: ${lastError?.message ?: "No screenshots captured."}")
-                updateBusy(false)
-                restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
-                return@launch
-            }
-
-            updateStatus("Captured $capturedCount screenshot${if (capturedCount == 1) "" else "s"}. Generating replies...")
-            val suggestionResult = requestSuggestions()
-
-            updateSuggestions(suggestionResult.getOrElse { error ->
-                updateStatus("Suggestion request failed: ${error.message}")
-                emptyList()
-            })
-
-            if (suggestions.isNotEmpty()) {
-                updateStatus("Suggestions ready.")
-            }
-
-            updateBusy(false)
-            restoreFloatingControlIfNeeded(shouldRestoreFloatingControl)
-        }
-    }
-
     private suspend fun captureAndStoreScreenshot(): Result<Boolean> {
         val service = captureService
         if (!isBound || service == null) {
@@ -542,14 +460,6 @@ class MainActivity : ComponentActivity() {
                 )
             )
         }
-    }
-
-    private fun normalizedBurstCount(): Int {
-        return burstCountText.toIntOrNull()?.coerceIn(1, 5) ?: 3
-    }
-
-    private fun normalizedBurstIntervalMs(): Int {
-        return burstIntervalMsText.toIntOrNull()?.coerceIn(500, 5_000) ?: 1_200
     }
 
     private fun removeCapture(id: Long) {
@@ -732,120 +642,99 @@ fun ReplyAssistantScreen(
     isBusy: Boolean,
     statusMessage: String,
     backendUrl: String,
-    sourceApp: String,
     tone: String,
     floatingControlEnabled: Boolean,
     overlayPermissionGranted: Boolean,
-    burstCount: String,
-    burstIntervalMs: String,
     captures: List<CapturedText>,
     contextDraft: String,
     suggestions: List<String>,
     onBackendUrlChange: (String) -> Unit,
-    onSourceAppChange: (String) -> Unit,
     onToneChange: (String) -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onFloatingControlChange: (Boolean) -> Unit,
-    onBurstCountChange: (String) -> Unit,
-    onBurstIntervalMsChange: (String) -> Unit,
     onContextChange: (String) -> Unit,
     onStartCapture: () -> Unit,
     onCaptureScreen: () -> Unit,
     onCaptureAfterDelay: () -> Unit,
-    onCaptureBurst: () -> Unit,
     onStopCapture: () -> Unit,
     onGenerate: () -> Unit,
     onRemoveCapture: (Long) -> Unit
 ) {
+    var showDetails by remember { mutableStateOf(false) }
+
     Scaffold { padding ->
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
                 Header(statusMessage = statusMessage)
             }
 
             item {
-                CaptureControls(
+                EssentialControls(
                     captureActive = captureActive,
                     isBound = isBound,
                     isBusy = isBusy,
+                    overlayPermissionGranted = overlayPermissionGranted,
+                    floatingControlEnabled = floatingControlEnabled,
+                    captureCount = captures.size,
+                    hasContext = contextDraft.isNotBlank(),
                     onStartCapture = onStartCapture,
-                    onCaptureScreen = onCaptureScreen,
-                    onCaptureAfterDelay = onCaptureAfterDelay,
+                    onRequestOverlayPermission = onRequestOverlayPermission,
+                    onFloatingControlChange = onFloatingControlChange,
+                    onGenerate = onGenerate,
                     onStopCapture = onStopCapture
                 )
             }
 
-            item {
-                FloatingCaptureControls(
-                    captureActive = captureActive,
-                    overlayPermissionGranted = overlayPermissionGranted,
-                    floatingControlEnabled = floatingControlEnabled,
-                    burstCount = burstCount,
-                    burstIntervalMs = burstIntervalMs,
-                    isBusy = isBusy,
-                    onRequestOverlayPermission = onRequestOverlayPermission,
-                    onFloatingControlChange = onFloatingControlChange,
-                    onBurstCountChange = onBurstCountChange,
-                    onBurstIntervalMsChange = onBurstIntervalMsChange,
-                    onCaptureBurst = onCaptureBurst
-                )
-            }
-
-            item {
-                SettingsFields(
-                    backendUrl = backendUrl,
-                    sourceApp = sourceApp,
-                    tone = tone,
-                    onBackendUrlChange = onBackendUrlChange,
-                    onSourceAppChange = onSourceAppChange,
-                    onToneChange = onToneChange
-                )
-            }
-
-            if (captures.isNotEmpty()) {
-                item {
-                    SectionTitle("Captured Text")
-                }
-
-                items(captures, key = { it.id }) { capture ->
-                    CapturedTextCard(capture = capture, onRemove = { onRemoveCapture(capture.id) })
-                }
-            }
-
-            item {
-                SectionTitle("Context")
-                OutlinedTextField(
-                    value = contextDraft,
-                    onValueChange = onContextChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 7,
-                    label = { Text("Text sent with screenshots") }
-                )
-            }
-
-            item {
-                Button(
-                    onClick = onGenerate,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isBusy && contextDraft.isNotBlank()
-                ) {
-                    Text(if (backendUrl.isBlank()) "Generate Local Mock Replies" else "Generate Replies")
-                }
-            }
-
             if (suggestions.isNotEmpty()) {
                 item {
-                    SectionTitle("Suggestions")
+                    SectionTitle("Replies")
                 }
 
                 items(suggestions) { suggestion ->
                     SuggestionCard(suggestion = suggestion)
+                }
+            }
+
+            item {
+                TextButton(
+                    onClick = { showDetails = !showDetails },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isBusy
+                ) {
+                    Text(if (showDetails) "Hide Details" else "Details")
+                }
+            }
+
+            if (showDetails) {
+                item {
+                    DetailsPanel(
+                        backendUrl = backendUrl,
+                        tone = tone,
+                        contextDraft = contextDraft,
+                        isBound = isBound,
+                        isBusy = isBusy,
+                        onBackendUrlChange = onBackendUrlChange,
+                        onToneChange = onToneChange,
+                        onContextChange = onContextChange,
+                        onCaptureScreen = onCaptureScreen,
+                        onCaptureAfterDelay = onCaptureAfterDelay
+                    )
+                }
+
+                if (captures.isNotEmpty()) {
+                    item {
+                        SectionTitle("Captured Text")
+                    }
+
+                    items(captures, key = { it.id }) { capture ->
+                        CapturedTextCard(capture = capture, onRemove = { onRemoveCapture(capture.id) })
+                    }
                 }
             }
         }
@@ -875,23 +764,58 @@ private fun Header(statusMessage: String) {
 }
 
 @Composable
-private fun CaptureControls(
+private fun EssentialControls(
     captureActive: Boolean,
     isBound: Boolean,
     isBusy: Boolean,
+    overlayPermissionGranted: Boolean,
+    floatingControlEnabled: Boolean,
+    captureCount: Int,
+    hasContext: Boolean,
     onStartCapture: () -> Unit,
-    onCaptureScreen: () -> Unit,
-    onCaptureAfterDelay: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onFloatingControlChange: (Boolean) -> Unit,
+    onGenerate: () -> Unit,
     onStopCapture: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        when {
+            !captureActive -> {
+                Button(
+                    onClick = onStartCapture,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isBusy
+                ) {
+                    Text("Start Capture")
+                }
+            }
+            !overlayPermissionGranted -> {
+                Button(
+                    onClick = onRequestOverlayPermission,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isBusy
+                ) {
+                    Text("Allow Floating Button")
+                }
+            }
+            else -> {
+                Button(
+                    onClick = { onFloatingControlChange(!floatingControlEnabled) },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isBusy
+                ) {
+                    Text(if (floatingControlEnabled) "Hide Floating Button" else "Open Floating Button")
+                }
+            }
+        }
+
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             Button(
-                onClick = onStartCapture,
+                onClick = onGenerate,
                 modifier = Modifier.weight(1f),
-                enabled = !captureActive && !isBusy
+                enabled = isBound && hasContext && !isBusy
             ) {
-                Text("Start Capture")
+                Text("Generate Replies")
             }
             OutlinedButton(
                 onClick = onStopCapture,
@@ -902,97 +826,34 @@ private fun CaptureControls(
             }
         }
 
-        Button(
-            onClick = onCaptureScreen,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = isBound && !isBusy
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = MaterialTheme.shapes.small,
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Capture Current Screen")
-        }
-
-        OutlinedButton(
-            onClick = onCaptureAfterDelay,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = isBound && !isBusy
-        ) {
-            Text("Capture After 5 Seconds")
+            Text(
+                text = "$captureCount screenshot${if (captureCount == 1) "" else "s"} collected",
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                style = MaterialTheme.typography.bodyMedium
+            )
         }
     }
 }
 
 @Composable
-private fun FloatingCaptureControls(
-    captureActive: Boolean,
-    overlayPermissionGranted: Boolean,
-    floatingControlEnabled: Boolean,
-    burstCount: String,
-    burstIntervalMs: String,
-    isBusy: Boolean,
-    onRequestOverlayPermission: () -> Unit,
-    onFloatingControlChange: (Boolean) -> Unit,
-    onBurstCountChange: (String) -> Unit,
-    onBurstIntervalMsChange: (String) -> Unit,
-    onCaptureBurst: () -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        SectionTitle("Floating Capture")
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedButton(
-                onClick = onRequestOverlayPermission,
-                modifier = Modifier.weight(1f),
-                enabled = !overlayPermissionGranted && !isBusy
-            ) {
-                Text(if (overlayPermissionGranted) "Overlay Allowed" else "Allow Overlay")
-            }
-            Button(
-                onClick = { onFloatingControlChange(!floatingControlEnabled) },
-                modifier = Modifier.weight(1f),
-                enabled = captureActive && overlayPermissionGranted && !isBusy
-            ) {
-                Text(if (floatingControlEnabled) "Hide Floating" else "Show Floating")
-            }
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = burstCount,
-                onValueChange = onBurstCountChange,
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                label = { Text("Shots") },
-                placeholder = { Text("3") }
-            )
-            OutlinedTextField(
-                value = burstIntervalMs,
-                onValueChange = onBurstIntervalMsChange,
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                label = { Text("Interval ms") },
-                placeholder = { Text("1200") }
-            )
-        }
-
-        OutlinedButton(
-            onClick = onCaptureBurst,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = captureActive && !isBusy
-        ) {
-            Text("Capture Burst + Generate")
-        }
-    }
-}
-
-@Composable
-private fun SettingsFields(
+private fun DetailsPanel(
     backendUrl: String,
-    sourceApp: String,
     tone: String,
+    contextDraft: String,
+    isBound: Boolean,
+    isBusy: Boolean,
     onBackendUrlChange: (String) -> Unit,
-    onSourceAppChange: (String) -> Unit,
-    onToneChange: (String) -> Unit
+    onToneChange: (String) -> Unit,
+    onContextChange: (String) -> Unit,
+    onCaptureScreen: () -> Unit,
+    onCaptureAfterDelay: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         OutlinedTextField(
             value = backendUrl,
             onValueChange = onBackendUrlChange,
@@ -1001,22 +862,36 @@ private fun SettingsFields(
             label = { Text("Backend URL") },
             placeholder = { Text("Set BACKEND_URL in .env or enter URL") }
         )
+        OutlinedTextField(
+            value = tone,
+            onValueChange = onToneChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Tone") }
+        )
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = sourceApp,
-                onValueChange = onSourceAppChange,
+            OutlinedButton(
+                onClick = onCaptureScreen,
                 modifier = Modifier.weight(1f),
-                singleLine = true,
-                label = { Text("Source") }
-            )
-            OutlinedTextField(
-                value = tone,
-                onValueChange = onToneChange,
+                enabled = isBound && !isBusy
+            ) {
+                Text("Capture Screen")
+            }
+            OutlinedButton(
+                onClick = onCaptureAfterDelay,
                 modifier = Modifier.weight(1f),
-                singleLine = true,
-                label = { Text("Tone") }
-            )
+                enabled = isBound && !isBusy
+            ) {
+                Text("Capture in 5s")
+            }
         }
+        OutlinedTextField(
+            value = contextDraft,
+            onValueChange = onContextChange,
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 5,
+            label = { Text("Context") }
+        )
     }
 }
 
@@ -1033,7 +908,7 @@ private fun CapturedTextCard(capture: CapturedText, onRemove: () -> Unit) {
                     Text("Remove")
                 }
             }
-            Divider()
+            HorizontalDivider()
             Text(capture.text, style = MaterialTheme.typography.bodyMedium)
         }
     }

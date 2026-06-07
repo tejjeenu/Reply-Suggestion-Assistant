@@ -320,6 +320,14 @@ class CaptureService : Service() {
     }
 
     private fun buildPanelHeader(): View {
+        val detailText = when {
+            floatingPanelState.suggestions.isNotEmpty() ->
+                "${floatingPanelState.suggestions.size} replies"
+            floatingPanelState.captures.isNotEmpty() ->
+                "${floatingPanelState.captures.size} screenshots"
+            else -> "Ready"
+        }
+
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -343,7 +351,7 @@ class CaptureService : Service() {
         )
         titleColumn.addView(
             TextView(this).apply {
-                text = "${floatingPanelState.captures.size} images"
+                text = detailText
                 textSize = 11f
                 setTextColor(PANEL_MUTED_TEXT)
                 includeFontPadding = false
@@ -351,6 +359,13 @@ class CaptureService : Service() {
         )
 
         header.addView(titleColumn)
+        if (floatingPanelState.captures.isNotEmpty() || floatingPanelState.suggestions.isNotEmpty()) {
+            header.addView(
+                headerButton("Clear") {
+                    overlayListener?.onOverlayClearRequested()
+                }
+            )
+        }
         header.addView(
             headerButton("Min") {
                 floatingPanelExpanded = false
@@ -406,28 +421,14 @@ class CaptureService : Service() {
 
         rows.addView(
             actionRow(
-                actionButton("Shot", enabled = !floatingPanelState.isBusy) {
+                actionButton("Capture", enabled = !floatingPanelState.isBusy) {
                     overlayListener?.onOverlayCaptureRequested()
                 },
-                actionButton("Burst", enabled = !floatingPanelState.isBusy) {
-                    overlayListener?.onOverlayBurstRequested()
-                }
-            )
-        )
-        rows.addView(
-            actionRow(
                 actionButton(
-                    label = "Replies",
+                    label = "Reply",
                     enabled = !floatingPanelState.isBusy && floatingPanelState.captures.isNotEmpty()
                 ) {
                     overlayListener?.onOverlayGenerateRequested()
-                },
-                actionButton(
-                    label = "Clear",
-                    enabled = !floatingPanelState.isBusy &&
-                        (floatingPanelState.captures.isNotEmpty() || floatingPanelState.suggestions.isNotEmpty())
-                ) {
-                    overlayListener?.onOverlayClearRequested()
                 }
             )
         )
@@ -458,19 +459,15 @@ class CaptureService : Service() {
             orientation = LinearLayout.VERTICAL
         }
 
-        content.addView(sectionTitle("Images"))
-        if (floatingPanelState.captures.isEmpty()) {
-            content.addView(emptyText("No images collected yet."))
-        } else {
-            floatingPanelState.captures.takeLast(MAX_CAPTURE_SUMMARIES).forEach { capture ->
-                content.addView(captureSummaryCard(capture))
-            }
-        }
-
-        content.addView(sectionTitle("Replies"))
         if (floatingPanelState.suggestions.isEmpty()) {
-            content.addView(emptyText("Replies will appear here."))
+            val emptyState = if (floatingPanelState.captures.isEmpty()) {
+                "No replies yet."
+            } else {
+                "${floatingPanelState.captures.size} screenshot${if (floatingPanelState.captures.size == 1) "" else "s"} ready."
+            }
+            content.addView(emptyText(emptyState))
         } else {
+            content.addView(sectionTitle("Replies"))
             floatingPanelState.suggestions.forEach { suggestion ->
                 content.addView(suggestionCard(suggestion))
             }
@@ -478,43 +475,6 @@ class CaptureService : Service() {
 
         scroll.addView(content)
         return scroll
-    }
-
-    private fun captureSummaryCard(capture: FloatingCaptureSummary): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
-            background = roundedDrawable(
-                color = Color.rgb(248, 250, 252),
-                strokeColor = Color.rgb(229, 234, 240),
-                radiusDp = 8
-            )
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = 6.dp()
-            }
-
-            addView(
-                TextView(context).apply {
-                    text = capture.title
-                    textSize = 12f
-                    setTypeface(Typeface.DEFAULT, Typeface.BOLD)
-                    setTextColor(PANEL_TEXT)
-                    includeFontPadding = false
-                }
-            )
-            addView(
-                TextView(context).apply {
-                    text = capture.previewText.ifBlank { "Image captured." }
-                    textSize = 11f
-                    setTextColor(PANEL_MUTED_TEXT)
-                    maxLines = 2
-                    ellipsize = TextUtils.TruncateAt.END
-                }
-            )
-        }
     }
 
     private fun suggestionCard(suggestion: String): View {
@@ -748,7 +708,6 @@ class CaptureService : Service() {
 
     interface OverlayListener {
         fun onOverlayCaptureRequested()
-        fun onOverlayBurstRequested()
         fun onOverlayGenerateRequested()
         fun onOverlayClearRequested()
         fun onOverlayClosed()
@@ -827,9 +786,8 @@ class CaptureService : Service() {
         private const val FLOATING_CONTROL_INITIAL_X = 24
         private const val FLOATING_CONTROL_INITIAL_Y = 220
         private const val DRAG_SLOP_PX = 8
-        private const val MAX_CAPTURE_SUMMARIES = 5
         private const val PANEL_WIDTH_DP = 340
-        private const val PANEL_HEIGHT_DP = 520
+        private const val PANEL_HEIGHT_DP = 400
         private val PANEL_ACCENT = Color.rgb(24, 96, 168)
         private val PANEL_TEXT = Color.rgb(23, 33, 43)
         private val PANEL_MUTED_TEXT = Color.rgb(89, 102, 116)
