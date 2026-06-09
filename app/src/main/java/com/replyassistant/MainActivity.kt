@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
 import androidx.activity.ComponentActivity
@@ -52,6 +53,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.replyassistant.accessibility.MessagingAccessibilityService
+import com.replyassistant.accessibility.MessagingScrollMonitor
 import com.replyassistant.capture.CaptureService
 import com.replyassistant.network.SuggestionApi
 import com.replyassistant.network.SuggestionImage
@@ -89,9 +92,18 @@ class MainActivity : ComponentActivity() {
     private var sourceApp by mutableStateOf("Current app")
     private var tone by mutableStateOf("casual, natural, helpful")
     private var floatingControlEnabled by mutableStateOf(false)
+    private var autoAssistantEnabled by mutableStateOf(false)
     private var overlayPermissionGranted by mutableStateOf(false)
+    private var accessibilityPermissionGranted by mutableStateOf(false)
     private var contextDraft by mutableStateOf("")
     private var suggestions by mutableStateOf<List<String>>(emptyList())
+    private var autoCaptureInFlight = false
+    private var autoSuggestionInFlight = false
+    private var autoScrollSessionActive = false
+    private var autoScrollSessionId = 0
+    private var lastAutoScrollAt = 0L
+    private var lastAutoCaptureAt = 0L
+    private var autoCaptureSequence = 0
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -135,6 +147,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val messagingScrollListener = object : MessagingScrollMonitor.Listener {
+        override fun onMessagingScrollDetected(packageName: String, appName: String) {
+            runOnUiThread {
+                handleMessagingScroll(packageName = packageName, appName = appName)
+            }
+        }
+    }
+
     private val overlayListener = object : CaptureService.OverlayListener {
         override fun onOverlayCaptureRequested() {
             runOnUiThread {
@@ -166,6 +186,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         refreshOverlayPermissionStatus()
+        refreshAccessibilityPermissionStatus()
         requestNotificationPermissionIfNeeded()
 
         setContent {
@@ -177,15 +198,17 @@ class MainActivity : ComponentActivity() {
                     statusMessage = statusMessage,
                     backendUrl = backendUrl,
                     tone = tone,
-                    floatingControlEnabled = floatingControlEnabled,
+                    autoAssistantEnabled = autoAssistantEnabled,
                     overlayPermissionGranted = overlayPermissionGranted,
+                    accessibilityPermissionGranted = accessibilityPermissionGranted,
                     captures = captures,
                     contextDraft = contextDraft,
                     suggestions = suggestions,
                     onBackendUrlChange = { backendUrl = it },
                     onToneChange = { tone = it },
                     onRequestOverlayPermission = ::requestOverlayPermission,
-                    onFloatingControlChange = ::updateFloatingControlEnabled,
+                    onRequestAccessibilityPermission = ::requestAccessibilityPermission,
+                    onAutoAssistantChange = ::updateAutoAssistantEnabled,
                     onContextChange = { contextDraft = it },
                     onStartCapture = ::requestScreenCapture,
                     onCaptureScreen = { captureAndRunOcr() },
@@ -201,15 +224,22 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshOverlayPermissionStatus()
+        refreshAccessibilityPermissionStatus()
         if (floatingControlEnabled && overlayPermissionGranted) {
             captureService?.let(::showFloatingControlIfPossible)
+        }
+        if (autoAssistantEnabled && !accessibilityPermissionGranted) {
+            updateAutoAssistantEnabled(false)
+            updateStatus("Background assistant stopped because messaging detection is disabled.")
         }
     }
 
     override fun onDestroy() {
+        MessagingScrollMonitor.unregister(messagingScrollListener)
         if (isBound) {
             captureService?.setOverlayListener(null)
             captureService?.hideFloatingControl()
+            captureService?.hideSuggestionPopup()
             unbindService(serviceConnection)
             isBound = false
         }
@@ -227,14 +257,35 @@ class MainActivity : ComponentActivity() {
         overlayPermissionGranted = canDrawOverlays()
     }
 
+    private fun refreshAccessibilityPermissionStatus() {
+        accessibilityPermissionGranted = isMessagingAccessibilityServiceEnabled()
+    }
+
     private fun canDrawOverlays(): Boolean {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+    }
+
+    private fun isMessagingAccessibilityServiceEnabled(): Boolean {
+        val expectedComponent = ComponentName(this, MessagingAccessibilityService::class.java)
+        val enabledServices = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+
+        val expectedNames = setOf(
+            expectedComponent.flattenToString(),
+            expectedComponent.flattenToShortString()
+        )
+
+        return enabledServices
+            .split(':')
+            .any { enabledService -> expectedNames.any { enabledService.equals(it, ignoreCase = true) } }
     }
 
     private fun requestOverlayPermission() {
         if (canDrawOverlays()) {
             overlayPermissionGranted = true
-            updateStatus("Floating panel permission is already enabled.")
+            updateStatus("Suggestion popup permission is already enabled.")
             return
         }
 
@@ -244,6 +295,11 @@ class MainActivity : ComponentActivity() {
         )
         startActivity(intent)
         updateStatus("Enable display-over-other-apps permission, then return to Reply Assistant.")
+    }
+
+    private fun requestAccessibilityPermission() {
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        updateStatus("Enable Reply Assistant in Accessibility settings, then return.")
     }
 
     private fun updateFloatingControlEnabled(enabled: Boolean) {
@@ -283,6 +339,205 @@ class MainActivity : ComponentActivity() {
         syncFloatingPanelState()
     }
 
+    private fun updateAutoAssistantEnabled(enabled: Boolean) {
+        if (enabled) {
+            if (!isBound || captureService == null) {
+                updateStatus("Start a capture session before running in the background.")
+                return
+            }
+
+            refreshAccessibilityPermissionStatus()
+            if (!accessibilityPermissionGranted) {
+                requestAccessibilityPermission()
+                return
+            }
+
+            refreshOverlayPermissionStatus()
+            if (!overlayPermissionGranted) {
+                requestOverlayPermission()
+                return
+            }
+
+            captureService?.hideFloatingControl()
+            captureService?.hideSuggestionPopup()
+            captures.clear()
+            contextDraft = ""
+            updateSuggestions(emptyList())
+            resetAutoScrollSession()
+            floatingControlEnabled = false
+            autoAssistantEnabled = true
+            MessagingScrollMonitor.register(messagingScrollListener)
+            updateStatus("Background assistant active. Open a supported messaging app and scroll.")
+            moveTaskToBack(true)
+        } else {
+            autoAssistantEnabled = false
+            resetAutoScrollSession()
+            MessagingScrollMonitor.unregister(messagingScrollListener)
+            captureService?.hideSuggestionPopup()
+            updateStatus("Background assistant stopped.")
+        }
+    }
+
+    private fun handleMessagingScroll(packageName: String, appName: String) {
+        if (!autoAssistantEnabled) return
+        if (!isBound || captureService == null) {
+            updateStatus("Background assistant paused. Start a capture session again.")
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (autoSuggestionInFlight) {
+            return
+        }
+
+        if (!autoScrollSessionActive) {
+            startAutoScrollSession(appName)
+        }
+
+        autoScrollSessionId += 1
+        lastAutoScrollAt = now
+        sourceApp = appName
+        captureService?.hideSuggestionPopup()
+
+        if (!autoCaptureInFlight && now - lastAutoCaptureAt >= AUTO_CAPTURE_SAMPLE_INTERVAL_MS) {
+            captureAutoScrollFrame(appName)
+        }
+
+        scheduleSuggestionsAfterScrollStop(
+            sessionId = autoScrollSessionId,
+            appName = appName
+        )
+    }
+
+    private fun startAutoScrollSession(appName: String) {
+        autoScrollSessionActive = true
+        captures.clear()
+        contextDraft = ""
+        updateSuggestions(emptyList())
+        autoCaptureSequence = 0
+        lastAutoCaptureAt = 0L
+        updateStatus("Scroll detected in $appName. Collecting screenshots...")
+    }
+
+    private fun captureAutoScrollFrame(appName: String) {
+        lastAutoCaptureAt = SystemClock.elapsedRealtime()
+        autoCaptureInFlight = true
+        updateBusy(true)
+
+        lifecycleScope.launch {
+            delay(AUTO_CAPTURE_SETTLE_DELAY_MS)
+
+            if (!autoAssistantEnabled || autoSuggestionInFlight) {
+                autoCaptureInFlight = false
+                updateBusy(false)
+                return@launch
+            }
+
+            autoCaptureSequence += 1
+
+            val captureResult = captureAndStoreScreenshot(
+                title = "$appName scroll $autoCaptureSequence"
+            )
+
+            captureResult
+                .onSuccess {
+                    pruneCaptures(MAX_AUTO_CAPTURE_HISTORY)
+                    updateStatus("Collecting screenshots from $appName...")
+                }
+                .onFailure { error ->
+                    updateStatus("Auto capture failed: ${error.message}")
+                }
+
+            updateBusy(false)
+            autoCaptureInFlight = false
+        }
+    }
+
+    private fun scheduleSuggestionsAfterScrollStop(sessionId: Int, appName: String) {
+        lifecycleScope.launch {
+            delay(AUTO_SCROLL_STOP_QUIET_MS)
+
+            val quietForMs = SystemClock.elapsedRealtime() - lastAutoScrollAt
+            if (
+                !autoAssistantEnabled ||
+                sessionId != autoScrollSessionId ||
+                quietForMs < AUTO_SCROLL_STOP_QUIET_MS
+            ) {
+                return@launch
+            }
+
+            generateAutoSuggestionsAfterScrollStop(
+                sessionId = sessionId,
+                appName = appName
+            )
+        }
+    }
+
+    private suspend fun generateAutoSuggestionsAfterScrollStop(sessionId: Int, appName: String) {
+        if (autoSuggestionInFlight) return
+
+        while (autoCaptureInFlight) {
+            delay(80)
+        }
+
+        if (!autoAssistantEnabled || sessionId != autoScrollSessionId) return
+
+        autoSuggestionInFlight = true
+        updateBusy(true)
+
+        if (captures.isEmpty()) {
+            updateStatus("Scrolling stopped in $appName. Capturing final context...")
+            autoCaptureSequence += 1
+            captureAndStoreScreenshot(title = "$appName final")
+                .onSuccess { pruneCaptures(MAX_AUTO_CAPTURE_HISTORY) }
+                .onFailure { error -> updateStatus("Final capture failed: ${error.message}") }
+        }
+
+        if (contextDraft.trim().isBlank()) {
+            updateStatus("Scrolling stopped, but no context was captured.")
+            autoSuggestionInFlight = false
+            autoScrollSessionActive = false
+            updateBusy(false)
+            return
+        }
+
+        updateStatus("Scrolling stopped in $appName. Generating replies from ${captures.size} screenshots...")
+        val suggestionResult = requestSuggestions()
+        val nextSuggestions = suggestionResult.getOrElse { error ->
+            updateStatus("Suggestion request failed: ${error.message}")
+            emptyList()
+        }
+        updateSuggestions(nextSuggestions)
+
+        if (nextSuggestions.isNotEmpty()) {
+            val popupShown = captureService?.showSuggestionPopup(
+                title = "Reply suggestions",
+                suggestions = nextSuggestions
+            ) ?: false
+            updateStatus(
+                if (popupShown) {
+                    "Suggestions shown for $appName."
+                } else {
+                    "Suggestions ready. Enable popup permission to show them."
+                }
+            )
+        }
+
+        autoSuggestionInFlight = false
+        autoScrollSessionActive = false
+        updateBusy(false)
+    }
+
+    private fun resetAutoScrollSession() {
+        autoScrollSessionId += 1
+        autoScrollSessionActive = false
+        autoCaptureInFlight = false
+        autoSuggestionInFlight = false
+        lastAutoScrollAt = 0L
+        lastAutoCaptureAt = 0L
+        autoCaptureSequence = 0
+    }
+
     private fun requestScreenCapture() {
         val projectionManager = getSystemService(MediaProjectionManager::class.java)
         screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
@@ -304,9 +559,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopCapture() {
+        autoAssistantEnabled = false
+        autoCaptureInFlight = false
+        MessagingScrollMonitor.unregister(messagingScrollListener)
         if (isBound) {
             captureService?.setOverlayListener(null)
             captureService?.hideFloatingControl()
+            captureService?.hideSuggestionPopup()
             unbindService(serviceConnection)
             isBound = false
         }
@@ -350,7 +609,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun captureAndStoreScreenshot(): Result<Boolean> {
+    private suspend fun captureAndStoreScreenshot(title: String? = null): Result<Boolean> {
         val service = captureService
         if (!isBound || service == null) {
             return Result.failure(IOException("Start a capture session first."))
@@ -371,7 +630,7 @@ class MainActivity : ComponentActivity() {
 
                                     val capture = CapturedText(
                                         id = System.currentTimeMillis(),
-                                        title = "Screenshot ${captures.size + 1}",
+                                        title = title ?: "Screenshot ${captures.size + 1}",
                                         text = cleanedText.ifBlank { "No readable text found." },
                                         imageMimeType = imageForVision?.mimeType,
                                         imageBase64 = imageForVision?.base64
@@ -469,6 +728,14 @@ class MainActivity : ComponentActivity() {
         syncFloatingPanelState()
     }
 
+    private fun pruneCaptures(maxCount: Int) {
+        while (captures.size > maxCount) {
+            captures.removeAt(0)
+        }
+        contextDraft = buildContextDraft()
+        syncFloatingPanelState()
+    }
+
     private fun clearFloatingPanelContext() {
         captures.clear()
         contextDraft = ""
@@ -522,6 +789,13 @@ class MainActivity : ComponentActivity() {
                 suggestions = suggestions
             )
         )
+    }
+
+    companion object {
+        private const val AUTO_CAPTURE_SETTLE_DELAY_MS = 350L
+        private const val AUTO_CAPTURE_SAMPLE_INTERVAL_MS = 900L
+        private const val AUTO_SCROLL_STOP_QUIET_MS = 1_400L
+        private const val MAX_AUTO_CAPTURE_HISTORY = 5
     }
 }
 
@@ -643,15 +917,17 @@ fun ReplyAssistantScreen(
     statusMessage: String,
     backendUrl: String,
     tone: String,
-    floatingControlEnabled: Boolean,
+    autoAssistantEnabled: Boolean,
     overlayPermissionGranted: Boolean,
+    accessibilityPermissionGranted: Boolean,
     captures: List<CapturedText>,
     contextDraft: String,
     suggestions: List<String>,
     onBackendUrlChange: (String) -> Unit,
     onToneChange: (String) -> Unit,
     onRequestOverlayPermission: () -> Unit,
-    onFloatingControlChange: (Boolean) -> Unit,
+    onRequestAccessibilityPermission: () -> Unit,
+    onAutoAssistantChange: (Boolean) -> Unit,
     onContextChange: (String) -> Unit,
     onStartCapture: () -> Unit,
     onCaptureScreen: () -> Unit,
@@ -680,12 +956,14 @@ fun ReplyAssistantScreen(
                     isBound = isBound,
                     isBusy = isBusy,
                     overlayPermissionGranted = overlayPermissionGranted,
-                    floatingControlEnabled = floatingControlEnabled,
+                    accessibilityPermissionGranted = accessibilityPermissionGranted,
+                    autoAssistantEnabled = autoAssistantEnabled,
                     captureCount = captures.size,
                     hasContext = contextDraft.isNotBlank(),
                     onStartCapture = onStartCapture,
                     onRequestOverlayPermission = onRequestOverlayPermission,
-                    onFloatingControlChange = onFloatingControlChange,
+                    onRequestAccessibilityPermission = onRequestAccessibilityPermission,
+                    onAutoAssistantChange = onAutoAssistantChange,
                     onGenerate = onGenerate,
                     onStopCapture = onStopCapture
                 )
@@ -769,12 +1047,14 @@ private fun EssentialControls(
     isBound: Boolean,
     isBusy: Boolean,
     overlayPermissionGranted: Boolean,
-    floatingControlEnabled: Boolean,
+    accessibilityPermissionGranted: Boolean,
+    autoAssistantEnabled: Boolean,
     captureCount: Int,
     hasContext: Boolean,
     onStartCapture: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
-    onFloatingControlChange: (Boolean) -> Unit,
+    onRequestAccessibilityPermission: () -> Unit,
+    onAutoAssistantChange: (Boolean) -> Unit,
     onGenerate: () -> Unit,
     onStopCapture: () -> Unit
 ) {
@@ -789,22 +1069,31 @@ private fun EssentialControls(
                     Text("Start Capture")
                 }
             }
+            !accessibilityPermissionGranted -> {
+                Button(
+                    onClick = onRequestAccessibilityPermission,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isBusy
+                ) {
+                    Text("Enable Messaging Detection")
+                }
+            }
             !overlayPermissionGranted -> {
                 Button(
                     onClick = onRequestOverlayPermission,
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isBusy
                 ) {
-                    Text("Allow Floating Button")
+                    Text("Allow Suggestion Popup")
                 }
             }
             else -> {
                 Button(
-                    onClick = { onFloatingControlChange(!floatingControlEnabled) },
+                    onClick = { onAutoAssistantChange(!autoAssistantEnabled) },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isBusy
                 ) {
-                    Text(if (floatingControlEnabled) "Hide Floating Button" else "Open Floating Button")
+                    Text(if (autoAssistantEnabled) "Stop Background Assistant" else "Run in Background")
                 }
             }
         }

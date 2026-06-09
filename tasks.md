@@ -1,6 +1,6 @@
 - choose appropriate LLM API to process images or text
 - setup and test with new LLM API
-- see if app can be as a floating icon in the background which can pop up if it identifies a good suggestion when prompted, some way of not needing to switch tabs to the original app to still use its capabilities
+- background assistant mode now detects scrolling in supported messaging apps, samples screenshots while scrolling, waits for scrolling to stop, then shows a closeable suggestion popup when replies are ready
 
 
 app design principles:

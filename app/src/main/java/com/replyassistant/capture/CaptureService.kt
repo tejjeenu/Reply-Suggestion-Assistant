@@ -51,9 +51,11 @@ class CaptureService : Service() {
     private var projectionHandler: Handler? = null
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
+    private var suggestionPopupView: View? = null
     private var overlayListener: OverlayListener? = null
     private var floatingPanelExpanded = true
     private var floatingPanelState = FloatingPanelState()
+    private var suggestionPopupState = SuggestionPopupState()
 
     @Volatile
     private var projectionReady = false
@@ -121,8 +123,35 @@ class CaptureService : Service() {
         }
     }
 
+    fun showSuggestionPopup(title: String, suggestions: List<String>): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            return false
+        }
+
+        if (suggestions.isEmpty()) {
+            return false
+        }
+
+        suggestionPopupState = SuggestionPopupState(
+            title = title,
+            suggestions = suggestions
+        )
+        windowManager = getSystemService(WindowManager::class.java)
+        mainHandler.post {
+            renderSuggestionPopup()
+        }
+        return true
+    }
+
+    fun hideSuggestionPopup() {
+        mainHandler.post {
+            removeSuggestionPopupView()
+        }
+    }
+
     override fun onDestroy() {
         hideFloatingControl()
+        hideSuggestionPopup()
         overlayListener = null
         projectionReady = false
         virtualDisplay?.release()
@@ -266,6 +295,100 @@ class CaptureService : Service() {
         val view = overlayView ?: return
         runCatching { windowManager?.removeView(view) }
         overlayView = null
+    }
+
+    private fun renderSuggestionPopup() {
+        val manager = windowManager ?: getSystemService(WindowManager::class.java).also {
+            windowManager = it
+        }
+
+        removeSuggestionPopupView()
+
+        runCatching {
+            val popup = buildSuggestionPopupView()
+            manager.addView(popup, suggestionPopupParams())
+            suggestionPopupView = popup
+        }
+    }
+
+    private fun removeSuggestionPopupView() {
+        val view = suggestionPopupView ?: return
+        runCatching { windowManager?.removeView(view) }
+        suggestionPopupView = null
+    }
+
+    private fun buildSuggestionPopupView(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(12.dp(), 12.dp(), 12.dp(), 12.dp())
+            background = roundedDrawable(
+                color = Color.WHITE,
+                strokeColor = Color.rgb(181, 196, 213),
+                radiusDp = 8
+            )
+            elevation = 18f
+        }
+
+        root.addView(buildSuggestionPopupHeader())
+
+        val scroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        suggestionPopupState.suggestions.forEach { suggestion ->
+            content.addView(suggestionCard(suggestion, ::copyPopupSuggestion))
+        }
+
+        scroll.addView(content)
+        root.addView(scroll)
+        return root
+    }
+
+    private fun buildSuggestionPopupHeader(): View {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 8.dp())
+        }
+
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        titleColumn.addView(
+            TextView(this).apply {
+                text = suggestionPopupState.title
+                textSize = 15f
+                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(PANEL_TEXT)
+                includeFontPadding = false
+            }
+        )
+        titleColumn.addView(
+            TextView(this).apply {
+                text = "${suggestionPopupState.suggestions.size} suggestions"
+                textSize = 11f
+                setTextColor(PANEL_MUTED_TEXT)
+                includeFontPadding = false
+            }
+        )
+
+        header.addView(titleColumn)
+        header.addView(
+            headerButton("Close") {
+                hideSuggestionPopup()
+            }
+        )
+
+        return header
     }
 
     private fun buildCompactTileView(): View {
@@ -469,7 +592,7 @@ class CaptureService : Service() {
         } else {
             content.addView(sectionTitle("Replies"))
             floatingPanelState.suggestions.forEach { suggestion ->
-                content.addView(suggestionCard(suggestion))
+                content.addView(suggestionCard(suggestion, ::copyFloatingSuggestion))
             }
         }
 
@@ -477,7 +600,7 @@ class CaptureService : Service() {
         return scroll
     }
 
-    private fun suggestionCard(suggestion: String): View {
+    private fun suggestionCard(suggestion: String, onCopy: (String) -> Unit): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
@@ -519,7 +642,7 @@ class CaptureService : Service() {
                     topMargin = 4.dp()
                 }
                 setOnClickListener {
-                    copySuggestion(suggestion)
+                    onCopy(suggestion)
                 }
             }
         )
@@ -527,11 +650,21 @@ class CaptureService : Service() {
         return card
     }
 
-    private fun copySuggestion(suggestion: String) {
-        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("Reply suggestion", suggestion))
+    private fun copyFloatingSuggestion(suggestion: String) {
+        copyToClipboard(suggestion)
         floatingPanelState = floatingPanelState.copy(statusMessage = "Copied reply.")
         renderFloatingControl()
+    }
+
+    private fun copyPopupSuggestion(suggestion: String) {
+        copyToClipboard(suggestion)
+        suggestionPopupState = suggestionPopupState.copy(title = "Copied reply")
+        renderSuggestionPopup()
+    }
+
+    private fun copyToClipboard(suggestion: String) {
+        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("Reply suggestion", suggestion))
     }
 
     private fun sectionTitle(title: String): View {
@@ -620,6 +753,20 @@ class CaptureService : Service() {
             gravity = Gravity.TOP or Gravity.START
             this.x = x
             this.y = y
+        }
+    }
+
+    private fun suggestionPopupParams(): WindowManager.LayoutParams {
+        return WindowManager.LayoutParams(
+            panelWidthPx(),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = SUGGESTION_POPUP_TOP_MARGIN_DP.dp()
         }
     }
 
@@ -726,6 +873,11 @@ class CaptureService : Service() {
         val suggestions: List<String> = emptyList()
     )
 
+    data class SuggestionPopupState(
+        val title: String = "Reply suggestions",
+        val suggestions: List<String> = emptyList()
+    )
+
     private inner class FloatingOverlayTouchListener(
         private val onClick: (() -> Unit)? = null
     ) : View.OnTouchListener {
@@ -788,6 +940,7 @@ class CaptureService : Service() {
         private const val DRAG_SLOP_PX = 8
         private const val PANEL_WIDTH_DP = 340
         private const val PANEL_HEIGHT_DP = 400
+        private const val SUGGESTION_POPUP_TOP_MARGIN_DP = 72
         private val PANEL_ACCENT = Color.rgb(24, 96, 168)
         private val PANEL_TEXT = Color.rgb(23, 33, 43)
         private val PANEL_MUTED_TEXT = Color.rgb(89, 102, 116)

@@ -7,9 +7,10 @@ Android MVP for capturing user-approved screen context, extracting text with Goo
 - Native Android app in Kotlin + Jetpack Compose.
 - User-approved `MediaProjection` screen capture session.
 - Foreground screen capture service with Android media projection service type.
+- Accessibility-based scroll detection for supported messaging apps.
 - Multiple manual screenshot captures per session.
-- Optional floating capture panel shown over other apps after explicit overlay permission.
-- Floating panel workflow for collecting screenshots, generating replies, and copying replies without returning to the main app.
+- Background assistant mode that samples screenshots during messaging-app scrolls.
+- Closeable suggestion popup shown only when replies are ready, after explicit overlay permission.
 - On-device ML Kit OCR for each screenshot.
 - Optional multimodal Groq/Llama 4 Scout analysis of the screenshot image plus OCR text, including visible image details like appearance, objects, activity, setting, and mood.
 - Editable context review before anything is sent out.
@@ -57,15 +58,15 @@ The app will install as `Reply Assistant`.
 
 1. Tap `Start Capture`.
 2. Approve Android's screen capture prompt.
-3. Tap `Allow Floating Button`, grant display-over-other-apps permission, then return to the app.
-4. Tap `Open Floating Button`.
-5. Switch to the target app and use the floating panel:
-   - `Capture` collects one screenshot.
-   - `Reply` processes the collected screenshots.
-   - `Copy` copies a generated reply.
-   - `Clear` resets the panel context when screenshots or replies exist.
-6. Open `Details` in the main app only when you need backend settings, manual capture fallback, or context review.
-7. Leave `Backend URL` blank for mock suggestions, or set it to your backend.
+3. Tap `Enable Messaging Detection`, enable `Reply Assistant` in Android Accessibility settings, then return to the app.
+4. Tap `Allow Suggestion Popup`, grant display-over-other-apps permission, then return to the app.
+5. Tap `Run in Background`.
+6. Open a supported messaging app and scroll the conversation. Reply Assistant starts a capture session when scrolling is detected, samples screenshots while scrolling, waits until scrolling stops, sends the captured batch to the configured backend or local mock flow, and shows a closeable popup when suggestions are ready.
+7. Use `Copy` inside the popup to copy a reply, or `Close` to dismiss it.
+8. Open `Details` in the main app only when you need backend settings, manual capture fallback, or context review.
+9. Leave `Backend URL` blank for mock suggestions, or set it to your backend.
+
+Supported messaging packages currently include WhatsApp, WhatsApp Business, Telegram, Signal, Messenger, Instagram, Discord, Google Messages, Samsung Messages, Google Chat, Slack, Microsoft Teams, Skype, LINE, Viber, Snapchat, and Hinge.
 
 ## Backend Setup
 
@@ -162,8 +163,9 @@ Your phone and computer must be on the same Wi-Fi. The Android manifest allows c
 
 ## Current Limitations
 
-- The floating panel is user-triggered. It does not automatically detect messaging apps.
-- Automatic foreground-app detection would need an additional, carefully justified accessibility or usage-access design.
+- Android still requires explicit user approval for each screen-capture session. The app cannot silently start screen capture after reboot or without the MediaProjection prompt.
+- Messaging-app scroll detection requires the user to enable the app's Accessibility service.
+- Automatic detection is limited to known Android messaging package names listed above.
 - Some protected screens may capture as black because Android apps can block screen capture.
 - ML Kit OCR extracts text locally; when a Groq backend URL is configured, the backend also sends a compressed screenshot image to Llama 4 Scout for visual context such as photos, shared images, objects, activities, and scene details.
 - API keys should stay on the backend. Do not put `GROQ_API_KEY` in Android code.
