@@ -18,41 +18,78 @@ import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.PhotoCamera
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Schedule
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Typography
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.replyassistant.accessibility.AssistantSessionState
+import com.replyassistant.accessibility.MessagingAssistantPrompt
 import com.replyassistant.accessibility.MessagingAccessibilityService
 import com.replyassistant.accessibility.MessagingScrollMonitor
 import com.replyassistant.capture.CaptureService
@@ -76,6 +113,11 @@ data class CapturedText(
     val imageMimeType: String? = null,
     val imageBase64: String? = null
 )
+
+private enum class PromptPermission {
+    ACCESSIBILITY,
+    OVERLAY
+}
 
 class MainActivity : ComponentActivity() {
     private val ocrProcessor = OcrProcessor()
@@ -104,6 +146,10 @@ class MainActivity : ComponentActivity() {
     private var lastAutoScrollAt = 0L
     private var lastAutoCaptureAt = 0L
     private var autoCaptureSequence = 0
+    private var promptedBackgroundStartRequested = false
+    private var pendingStartBackgroundAfterCapture = false
+    private var promptWaitingForPermission: PromptPermission? = null
+    private var pendingPromptSourceApp = "Current app"
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -119,6 +165,8 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startCaptureService(result.resultCode, result.data!!)
         } else {
+            pendingStartBackgroundAfterCapture = false
+            promptedBackgroundStartRequested = false
             updateStatus("Screen capture permission cancelled.")
         }
     }
@@ -131,7 +179,10 @@ class MainActivity : ComponentActivity() {
             isBound = true
             captureActive = true
             syncFloatingPanelState()
-            if (floatingControlEnabled) {
+            if (pendingStartBackgroundAfterCapture) {
+                pendingStartBackgroundAfterCapture = false
+                continuePromptedBackgroundStart()
+            } else if (floatingControlEnabled) {
                 showFloatingControlIfPossible(service)
             } else {
                 updateStatus("Capture session ready.")
@@ -143,6 +194,7 @@ class MainActivity : ComponentActivity() {
             captureService = null
             isBound = false
             captureActive = false
+            AssistantSessionState.setBackgroundAssistantActive(this@MainActivity, false)
             updateStatus("Capture service disconnected.")
         }
     }
@@ -219,6 +271,14 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+
+        handleLaunchIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
     }
 
     override fun onResume() {
@@ -232,10 +292,14 @@ class MainActivity : ComponentActivity() {
             updateAutoAssistantEnabled(false)
             updateStatus("Background assistant stopped because messaging detection is disabled.")
         }
+        resumePromptedBackgroundStartIfNeeded()
     }
 
     override fun onDestroy() {
         MessagingScrollMonitor.unregister(messagingScrollListener)
+        if (autoAssistantEnabled) {
+            AssistantSessionState.setBackgroundAssistantActive(this, false)
+        }
         if (isBound) {
             captureService?.setOverlayListener(null)
             captureService?.hideFloatingControl()
@@ -280,6 +344,72 @@ class MainActivity : ComponentActivity() {
         return enabledServices
             .split(':')
             .any { enabledService -> expectedNames.any { enabledService.equals(it, ignoreCase = true) } }
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.action != MessagingAssistantPrompt.ACTION_START_BACKGROUND_ASSISTANT) return
+
+        pendingPromptSourceApp = intent.getStringExtra(MessagingAssistantPrompt.EXTRA_SOURCE_APP)
+            ?: "Current app"
+        sourceApp = pendingPromptSourceApp
+        promptedBackgroundStartRequested = true
+        promptWaitingForPermission = null
+        MessagingAssistantPrompt.dismiss(this)
+        updateStatus("Start Reply Assistant for $pendingPromptSourceApp.")
+        continuePromptedBackgroundStart()
+    }
+
+    private fun resumePromptedBackgroundStartIfNeeded() {
+        if (!promptedBackgroundStartRequested || pendingStartBackgroundAfterCapture) return
+
+        val waitingFor = promptWaitingForPermission
+        promptWaitingForPermission = null
+
+        when (waitingFor) {
+            PromptPermission.ACCESSIBILITY -> {
+                if (!accessibilityPermissionGranted) {
+                    updateStatus("Enable Reply Assistant in Accessibility settings to show prompts in messaging apps.")
+                    return
+                }
+            }
+            PromptPermission.OVERLAY -> {
+                if (!overlayPermissionGranted) {
+                    updateStatus("Allow display-over-other-apps permission to show reply popups.")
+                    return
+                }
+            }
+            null -> Unit
+        }
+
+        continuePromptedBackgroundStart()
+    }
+
+    private fun continuePromptedBackgroundStart() {
+        if (!promptedBackgroundStartRequested) return
+
+        refreshAccessibilityPermissionStatus()
+        refreshOverlayPermissionStatus()
+
+        if (!accessibilityPermissionGranted) {
+            promptWaitingForPermission = PromptPermission.ACCESSIBILITY
+            requestAccessibilityPermission()
+            return
+        }
+
+        if (!overlayPermissionGranted) {
+            promptWaitingForPermission = PromptPermission.OVERLAY
+            requestOverlayPermission()
+            return
+        }
+
+        if (!isBound || captureService == null) {
+            pendingStartBackgroundAfterCapture = true
+            updateStatus("Approve screen capture to run in the background for $pendingPromptSourceApp.")
+            requestScreenCapture()
+            return
+        }
+
+        updateAutoAssistantEnabled(true)
     }
 
     private fun requestOverlayPermission() {
@@ -366,11 +496,17 @@ class MainActivity : ComponentActivity() {
             resetAutoScrollSession()
             floatingControlEnabled = false
             autoAssistantEnabled = true
+            promptedBackgroundStartRequested = false
+            pendingStartBackgroundAfterCapture = false
+            promptWaitingForPermission = null
+            AssistantSessionState.setBackgroundAssistantActive(this, true)
+            MessagingAssistantPrompt.dismiss(this)
             MessagingScrollMonitor.register(messagingScrollListener)
             updateStatus("Background assistant active. Open a supported messaging app and scroll.")
             moveTaskToBack(true)
         } else {
             autoAssistantEnabled = false
+            AssistantSessionState.setBackgroundAssistantActive(this, false)
             resetAutoScrollSession()
             MessagingScrollMonitor.unregister(messagingScrollListener)
             captureService?.hideSuggestionPopup()
@@ -561,6 +697,10 @@ class MainActivity : ComponentActivity() {
     private fun stopCapture() {
         autoAssistantEnabled = false
         autoCaptureInFlight = false
+        promptedBackgroundStartRequested = false
+        pendingStartBackgroundAfterCapture = false
+        promptWaitingForPermission = null
+        AssistantSessionState.setBackgroundAssistantActive(this, false)
         MessagingScrollMonitor.unregister(messagingScrollListener)
         if (isBound) {
             captureService?.setOverlayListener(null)
@@ -904,7 +1044,9 @@ object TextCleaner {
 @Composable
 fun ReplyAssistantTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = androidx.compose.material3.lightColorScheme(),
+        colorScheme = ReplyColorScheme,
+        typography = ReplyTypography,
+        shapes = ReplyShapes,
         content = content
     )
 }
@@ -938,20 +1080,25 @@ fun ReplyAssistantScreen(
 ) {
     var showDetails by remember { mutableStateOf(false) }
 
-    Scaffold { padding ->
+    Scaffold(containerColor = AppBackground) { padding ->
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
+                .background(AppBackground)
                 .padding(padding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(horizontal = 18.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
-                Header(statusMessage = statusMessage)
+                Header(
+                    statusMessage = statusMessage,
+                    isBusy = isBusy,
+                    autoAssistantEnabled = autoAssistantEnabled
+                )
             }
 
             item {
-                EssentialControls(
+                ControlPanel(
                     captureActive = captureActive,
                     isBound = isBound,
                     isBusy = isBusy,
@@ -969,13 +1116,19 @@ fun ReplyAssistantScreen(
                 )
             }
 
-            if (suggestions.isNotEmpty()) {
-                item {
-                    SectionTitle("Replies")
-                }
-
-                items(suggestions) { suggestion ->
-                    SuggestionCard(suggestion = suggestion)
+            item {
+                AnimatedVisibility(
+                    visible = suggestions.isNotEmpty(),
+                    enter = fadeIn(animationSpec = tween(180)) +
+                        expandVertically(animationSpec = tween(220)),
+                    exit = fadeOut(animationSpec = tween(120))
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SectionTitle("Replies")
+                        suggestions.take(3).forEachIndexed { index, suggestion ->
+                            SuggestionCard(suggestion = suggestion, index = index)
+                        }
+                    }
                 }
             }
 
@@ -985,33 +1138,50 @@ fun ReplyAssistantScreen(
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isBusy
                 ) {
+                    Icon(
+                        imageVector = if (showDetails) {
+                            Icons.Rounded.KeyboardArrowUp
+                        } else {
+                            Icons.Rounded.KeyboardArrowDown
+                        },
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(if (showDetails) "Hide Details" else "Details")
                 }
             }
 
-            if (showDetails) {
-                item {
-                    DetailsPanel(
-                        backendUrl = backendUrl,
-                        tone = tone,
-                        contextDraft = contextDraft,
-                        isBound = isBound,
-                        isBusy = isBusy,
-                        onBackendUrlChange = onBackendUrlChange,
-                        onToneChange = onToneChange,
-                        onContextChange = onContextChange,
-                        onCaptureScreen = onCaptureScreen,
-                        onCaptureAfterDelay = onCaptureAfterDelay
-                    )
-                }
+            item {
+                AnimatedVisibility(
+                    visible = showDetails,
+                    enter = fadeIn(animationSpec = tween(160)) +
+                        expandVertically(animationSpec = tween(220)),
+                    exit = fadeOut(animationSpec = tween(120))
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        DetailsPanel(
+                            backendUrl = backendUrl,
+                            tone = tone,
+                            contextDraft = contextDraft,
+                            isBound = isBound,
+                            isBusy = isBusy,
+                            onBackendUrlChange = onBackendUrlChange,
+                            onToneChange = onToneChange,
+                            onContextChange = onContextChange,
+                            onCaptureScreen = onCaptureScreen,
+                            onCaptureAfterDelay = onCaptureAfterDelay
+                        )
 
-                if (captures.isNotEmpty()) {
-                    item {
-                        SectionTitle("Captured Text")
-                    }
-
-                    items(captures, key = { it.id }) { capture ->
-                        CapturedTextCard(capture = capture, onRemove = { onRemoveCapture(capture.id) })
+                        if (captures.isNotEmpty()) {
+                            SectionTitle("Captured Text")
+                            captures.forEach { capture ->
+                                CapturedTextCard(
+                                    capture = capture,
+                                    onRemove = { onRemoveCapture(capture.id) }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1020,29 +1190,75 @@ fun ReplyAssistantScreen(
 }
 
 @Composable
-private fun Header(statusMessage: String) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = "Reply Assistant",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold
-        )
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            shape = MaterialTheme.shapes.medium,
-            modifier = Modifier.fillMaxWidth()
+private fun Header(statusMessage: String, isBusy: Boolean, autoAssistantEnabled: Boolean) {
+    Surface(
+        color = AppSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        tonalElevation = 0.dp,
+        shadowElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = statusMessage,
-                modifier = Modifier.padding(12.dp),
-                style = MaterialTheme.typography.bodyMedium
-            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Reply Assistant",
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = AppInk
+                    )
+                    Text(
+                        text = if (autoAssistantEnabled) "Background mode" else "On-device capture",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AppMuted
+                    )
+                }
+                Surface(
+                    color = if (autoAssistantEnabled) AppSuccessSoft else AppWarmSoft,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = if (autoAssistantEnabled) "Active" else "Manual",
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (autoAssistantEnabled) AppPrimaryDark else AppSecondary
+                    )
+                }
+            }
+
+            Surface(
+                color = if (isBusy) AppInfoSoft else Color(0xFFF4F6F4),
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, if (isBusy) Color(0xFFD7E6FF) else AppLine),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column {
+                    Text(
+                        text = statusMessage,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AppInk
+                    )
+                    AnimatedVisibility(visible = isBusy) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(3.dp),
+                            color = AppPrimary,
+                            trackColor = Color.Transparent
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun EssentialControls(
+private fun ControlPanel(
     captureActive: Boolean,
     isBound: Boolean,
     isBusy: Boolean,
@@ -1058,74 +1274,131 @@ private fun EssentialControls(
     onGenerate: () -> Unit,
     onStopCapture: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        when {
-            !captureActive -> {
-                Button(
-                    onClick = onStartCapture,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isBusy
-                ) {
-                    Text("Start Capture")
-                }
-            }
-            !accessibilityPermissionGranted -> {
-                Button(
-                    onClick = onRequestAccessibilityPermission,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isBusy
-                ) {
-                    Text("Enable Messaging Detection")
-                }
-            }
-            !overlayPermissionGranted -> {
-                Button(
-                    onClick = onRequestOverlayPermission,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isBusy
-                ) {
-                    Text("Allow Suggestion Popup")
-                }
-            }
-            else -> {
-                Button(
-                    onClick = { onAutoAssistantChange(!autoAssistantEnabled) },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !isBusy
-                ) {
-                    Text(if (autoAssistantEnabled) "Stop Background Assistant" else "Run in Background")
-                }
-            }
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(
-                onClick = onGenerate,
-                modifier = Modifier.weight(1f),
-                enabled = isBound && hasContext && !isBusy
-            ) {
-                Text("Generate Replies")
-            }
-            OutlinedButton(
-                onClick = onStopCapture,
-                modifier = Modifier.weight(1f),
-                enabled = captureActive && !isBusy
-            ) {
-                Text("Stop")
-            }
-        }
-
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            shape = MaterialTheme.shapes.small,
-            modifier = Modifier.fillMaxWidth()
+    Surface(
+        color = AppSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        shadowElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                text = "$captureCount screenshot${if (captureCount == 1) "" else "s"} collected",
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                style = MaterialTheme.typography.bodyMedium
-            )
+            val primaryLabel: String
+            val primaryIcon = when {
+                !captureActive -> {
+                    primaryLabel = "Start Capture"
+                    Icons.Rounded.PlayArrow
+                }
+                !accessibilityPermissionGranted -> {
+                    primaryLabel = "Enable Detection"
+                    Icons.Rounded.Settings
+                }
+                !overlayPermissionGranted -> {
+                    primaryLabel = "Allow Popup"
+                    Icons.Rounded.ChatBubbleOutline
+                }
+                autoAssistantEnabled -> {
+                    primaryLabel = "Stop Background"
+                    Icons.Rounded.Stop
+                }
+                else -> {
+                    primaryLabel = "Run in Background"
+                    Icons.Rounded.AutoAwesome
+                }
+            }
+
+            Button(
+                onClick = {
+                    when {
+                        !captureActive -> onStartCapture()
+                        !accessibilityPermissionGranted -> onRequestAccessibilityPermission()
+                        !overlayPermissionGranted -> onRequestOverlayPermission()
+                        else -> onAutoAssistantChange(!autoAssistantEnabled)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .defaultMinSize(minHeight = 52.dp),
+                enabled = !isBusy,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = AppPrimary,
+                    contentColor = Color.White
+                )
+            ) {
+                Icon(primaryIcon, contentDescription = null, modifier = Modifier.size(19.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(primaryLabel)
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = onGenerate,
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 46.dp),
+                    enabled = isBound && hasContext && !isBusy,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = AppInk,
+                        contentColor = Color.White,
+                        disabledContainerColor = Color(0xFFE5E7EB),
+                        disabledContentColor = AppMuted
+                    )
+                ) {
+                    Icon(Icons.Rounded.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Generate")
+                }
+                OutlinedButton(
+                    onClick = onStopCapture,
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 46.dp),
+                    enabled = captureActive && !isBusy,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, AppLine),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AppInk)
+                ) {
+                    Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Stop")
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                StatusChip(
+                    label = "$captureCount screenshot${if (captureCount == 1) "" else "s"}",
+                    color = if (captureCount > 0) AppSuccessSoft else Color(0xFFF2F4F7),
+                    textColor = if (captureCount > 0) AppPrimaryDark else AppMuted,
+                    modifier = Modifier.weight(1f)
+                )
+                StatusChip(
+                    label = if (hasContext) "Context ready" else "No context",
+                    color = if (hasContext) AppInfoSoft else Color(0xFFF2F4F7),
+                    textColor = if (hasContext) Color(0xFF23539D) else AppMuted,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
+    }
+}
+
+@Composable
+private fun StatusChip(label: String, color: Color, textColor: Color, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        color = color,
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = textColor
+        )
     }
 }
 
@@ -1142,45 +1415,70 @@ private fun DetailsPanel(
     onCaptureScreen: () -> Unit,
     onCaptureAfterDelay: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        OutlinedTextField(
-            value = backendUrl,
-            onValueChange = onBackendUrlChange,
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Backend URL") },
-            placeholder = { Text("Set BACKEND_URL in .env or enter URL") }
-        )
-        OutlinedTextField(
-            value = tone,
-            onValueChange = onToneChange,
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Tone") }
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedButton(
-                onClick = onCaptureScreen,
-                modifier = Modifier.weight(1f),
-                enabled = isBound && !isBusy
-            ) {
-                Text("Capture Screen")
+    Surface(
+        color = AppSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedTextField(
+                value = backendUrl,
+                onValueChange = onBackendUrlChange,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                shape = RoundedCornerShape(8.dp),
+                label = { Text("Backend URL") },
+                placeholder = { Text("Set BACKEND_URL in .env or enter URL") }
+            )
+            OutlinedTextField(
+                value = tone,
+                onValueChange = onToneChange,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                shape = RoundedCornerShape(8.dp),
+                label = { Text("Tone") }
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onCaptureScreen,
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 44.dp),
+                    enabled = isBound && !isBusy,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, AppLine)
+                ) {
+                    Icon(Icons.Rounded.PhotoCamera, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Capture")
+                }
+                OutlinedButton(
+                    onClick = onCaptureAfterDelay,
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 44.dp),
+                    enabled = isBound && !isBusy,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, AppLine)
+                ) {
+                    Icon(Icons.Rounded.Schedule, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("5s Delay")
+                }
             }
-            OutlinedButton(
-                onClick = onCaptureAfterDelay,
-                modifier = Modifier.weight(1f),
-                enabled = isBound && !isBusy
-            ) {
-                Text("Capture in 5s")
-            }
+            OutlinedTextField(
+                value = contextDraft,
+                onValueChange = onContextChange,
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 5,
+                shape = RoundedCornerShape(8.dp),
+                label = { Text("Context") }
+            )
         }
-        OutlinedTextField(
-            value = contextDraft,
-            onValueChange = onContextChange,
-            modifier = Modifier.fillMaxWidth(),
-            minLines = 5,
-            label = { Text("Context") }
-        )
     }
 }
 
@@ -1188,37 +1486,96 @@ private fun DetailsPanel(
 private fun CapturedTextCard(capture: CapturedText, onRemove: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        colors = CardDefaults.cardColors(containerColor = AppSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(capture.title, fontWeight = FontWeight.SemiBold)
-                TextButton(onClick = onRemove) {
+                Text(
+                    capture.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = AppInk,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onRemove, shape = RoundedCornerShape(8.dp)) {
+                    Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text("Remove")
                 }
             }
             HorizontalDivider()
-            Text(capture.text, style = MaterialTheme.typography.bodyMedium)
+            Text(capture.text, style = MaterialTheme.typography.bodyMedium, color = AppInk)
         }
     }
 }
 
 @Composable
-private fun SuggestionCard(suggestion: String) {
+private fun SuggestionCard(suggestion: String, index: Int) {
     val clipboardManager = LocalClipboardManager.current
+    var visible by remember(suggestion) { mutableStateOf(false) }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    LaunchedEffect(suggestion) {
+        delay(index * 70L)
+        visible = true
+    }
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = scaleIn(
+            initialScale = 0.94f,
+            animationSpec = tween(durationMillis = 220)
+        ) + fadeIn(animationSpec = tween(180)) +
+            slideInVertically(
+                initialOffsetY = { it / 6 },
+                animationSpec = tween(220)
+            )
     ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(suggestion, style = MaterialTheme.typography.bodyLarge)
-            Row {
-                Spacer(modifier = Modifier.weight(1f))
-                OutlinedButton(
-                    onClick = { clipboardManager.setText(AnnotatedString(suggestion)) }
-                ) {
-                    Text("Copy")
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            border = BorderStroke(1.dp, Color(0xFFD8E8DF)),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFFBFEFC)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(AppSuccessSoft)
+                    ) {
+                        Icon(
+                            Icons.Rounded.ChatBubbleOutline,
+                            contentDescription = null,
+                            tint = AppPrimary,
+                            modifier = Modifier
+                                .size(17.dp)
+                                .padding(0.dp)
+                                .align(androidx.compose.ui.Alignment.Center)
+                        )
+                    }
+                    Text(
+                        suggestion,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = AppInk,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row {
+                    Spacer(modifier = Modifier.weight(1f))
+                    OutlinedButton(
+                        onClick = { clipboardManager.setText(AnnotatedString(suggestion)) },
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, Color(0xFFD8E8DF)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AppPrimary)
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Copy")
+                    }
                 }
             }
         }
@@ -1231,9 +1588,90 @@ private fun SectionTitle(title: String) {
         Text(
             text = title,
             style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold
+            fontWeight = FontWeight.SemiBold,
+            color = AppInk
         )
         Spacer(modifier = Modifier.width(8.dp))
     }
     Spacer(modifier = Modifier.height(2.dp))
 }
+
+private val AppBackground = Color(0xFFF7F8F6)
+private val AppSurface = Color(0xFFFFFFFF)
+private val AppInk = Color(0xFF111827)
+private val AppMuted = Color(0xFF65717E)
+private val AppLine = Color(0xFFE3E7E4)
+private val AppPrimary = Color(0xFF0F766E)
+private val AppPrimaryDark = Color(0xFF0B4F49)
+private val AppSecondary = Color(0xFFD36B4C)
+private val AppSuccessSoft = Color(0xFFE8F5EF)
+private val AppInfoSoft = Color(0xFFEFF5FF)
+private val AppWarmSoft = Color(0xFFFFF0E8)
+
+private val ReplyColorScheme = lightColorScheme(
+    primary = AppPrimary,
+    onPrimary = Color.White,
+    secondary = AppSecondary,
+    onSecondary = Color.White,
+    tertiary = Color(0xFF315C9E),
+    background = AppBackground,
+    onBackground = AppInk,
+    surface = AppSurface,
+    onSurface = AppInk,
+    surfaceVariant = Color(0xFFF0F3F0),
+    onSurfaceVariant = AppMuted,
+    outline = AppLine
+)
+
+private val BaseTypography = Typography()
+private val ReplyTypography = Typography(
+    headlineSmall = BaseTypography.headlineSmall.copy(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 25.sp,
+        lineHeight = 30.sp,
+        letterSpacing = 0.sp
+    ),
+    titleMedium = BaseTypography.titleMedium.copy(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.sp
+    ),
+    titleSmall = BaseTypography.titleSmall.copy(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.sp
+    ),
+    bodyLarge = BaseTypography.bodyLarge.copy(
+        fontFamily = FontFamily.SansSerif,
+        lineHeight = 22.sp,
+        letterSpacing = 0.sp
+    ),
+    bodyMedium = BaseTypography.bodyMedium.copy(
+        fontFamily = FontFamily.SansSerif,
+        lineHeight = 20.sp,
+        letterSpacing = 0.sp
+    ),
+    bodySmall = BaseTypography.bodySmall.copy(
+        fontFamily = FontFamily.SansSerif,
+        letterSpacing = 0.sp
+    ),
+    labelMedium = BaseTypography.labelMedium.copy(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.Medium,
+        letterSpacing = 0.sp
+    ),
+    labelLarge = BaseTypography.labelLarge.copy(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.sp
+    )
+)
+
+private val ReplyShapes = Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small = RoundedCornerShape(8.dp),
+    medium = RoundedCornerShape(8.dp),
+    large = RoundedCornerShape(8.dp),
+    extraLarge = RoundedCornerShape(8.dp)
+)

@@ -10,9 +10,10 @@ Android MVP for capturing user-approved screen context, extracting text with Goo
 - Accessibility-based scroll detection for supported messaging apps.
 - Multiple manual screenshot captures per session.
 - Background assistant mode that samples screenshots during messaging-app scrolls.
+- Accessibility-based launch prompt when a supported messaging app is opened and the background assistant is not already running.
 - Closeable suggestion popup shown only when replies are ready, after explicit overlay permission.
 - On-device ML Kit OCR for each screenshot.
-- Optional multimodal Groq/Llama 4 Scout analysis of the screenshot image plus OCR text, including visible image details like appearance, objects, activity, setting, and mood.
+- Optional two-stage Groq pipeline: Llama 4 Scout extracts screenshot/transcript context, then Llama 3.3 70B writes the final TextMaster AI reply options.
 - Editable context review before anything is sent out.
 - Reply suggestions through a backend URL, with local mock suggestions when the backend URL is blank.
 - Tiny FastAPI backend that can call Groq without putting `GROQ_API_KEY` inside the APK.
@@ -66,6 +67,8 @@ The app will install as `Reply Assistant`.
 8. Open `Details` in the main app only when you need backend settings, manual capture fallback, or context review.
 9. Leave `Backend URL` blank for mock suggestions, or set it to your backend.
 
+After messaging detection is enabled, opening a supported messaging app while the assistant is not running can show a `Use Reply Assistant` notification. Tapping it opens the app, requests any missing permissions, starts Android's screen-capture consent flow, and then runs the background assistant.
+
 Supported messaging packages currently include WhatsApp, WhatsApp Business, Telegram, Signal, Messenger, Instagram, Discord, Google Messages, Samsung Messages, Google Chat, Slack, Microsoft Teams, Skype, LINE, Viber, Snapchat, and Hinge.
 
 ## Backend Setup
@@ -103,10 +106,16 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python -m pip install -r requirements.txt
 ```
 
-4. Start the backend on all network interfaces:
+4. Start the backend on all network interfaces from inside the `backend` folder:
 
 ```powershell
 python -m uvicorn main:app --host 0.0.0.0 --port 3000
+```
+
+If your terminal is still in the project root, use this instead:
+
+```powershell
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 3000
 ```
 
 Leave this terminal open while testing. You can also run the backend with:
@@ -153,19 +162,23 @@ http://YOUR_LAN_IP:3000/health
 
 If this does not load, your phone is probably not on the same Wi-Fi or Windows Firewall is blocking Python. Allow Python/uvicorn on private networks, then retry.
 
-Optional model override before starting the backend:
+Optional model overrides before starting the backend:
 
 ```powershell
-$env:GROQ_MODEL="meta-llama/llama-4-scout-17b-16e-instruct"
+$env:GROQ_VISION_MODEL="meta-llama/llama-4-scout-17b-16e-instruct"
+$env:GROQ_TEXT_MODEL="llama-3.3-70b-versatile"
 ```
+
+`GROQ_MODEL` is still accepted as a legacy alias for the vision model.
 
 Your phone and computer must be on the same Wi-Fi. The Android manifest allows cleartext HTTP for local MVP testing; use HTTPS for production.
 
 ## Current Limitations
 
 - Android still requires explicit user approval for each screen-capture session. The app cannot silently start screen capture after reboot or without the MediaProjection prompt.
+- The supported-app launch prompt uses Android notifications. On Android 13+, notification permission must be granted before that prompt can appear.
 - Messaging-app scroll detection requires the user to enable the app's Accessibility service.
 - Automatic detection is limited to known Android messaging package names listed above.
 - Some protected screens may capture as black because Android apps can block screen capture.
-- ML Kit OCR extracts text locally; when a Groq backend URL is configured, the backend also sends a compressed screenshot image to Llama 4 Scout for visual context such as photos, shared images, objects, activities, and scene details.
+- ML Kit OCR extracts text locally; when a Groq backend URL is configured, the backend sends compressed screenshots to Llama 4 Scout for visual context, then sends the extracted context plus OCR text to Llama 3.3 70B for final reply generation.
 - API keys should stay on the backend. Do not put `GROQ_API_KEY` in Android code.

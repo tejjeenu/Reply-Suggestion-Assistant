@@ -1,5 +1,9 @@
 package com.replyassistant.capture
 
+import android.animation.Animator
+import android.animation.AnimatorSet
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -31,6 +35,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -54,6 +60,8 @@ class CaptureService : Service() {
     private var suggestionPopupView: View? = null
     private var overlayListener: OverlayListener? = null
     private var floatingPanelExpanded = true
+    private var suggestionPopupX: Int? = null
+    private var suggestionPopupY: Int? = null
     private var floatingPanelState = FloatingPanelState()
     private var suggestionPopupState = SuggestionPopupState()
 
@@ -308,6 +316,7 @@ class CaptureService : Service() {
             val popup = buildSuggestionPopupView()
             manager.addView(popup, suggestionPopupParams())
             suggestionPopupView = popup
+            animateSpeechBubblePopup(popup)
         }
     }
 
@@ -320,16 +329,39 @@ class CaptureService : Service() {
     private fun buildSuggestionPopupView(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(12.dp(), 12.dp(), 12.dp(), 12.dp())
-            background = roundedDrawable(
-                color = Color.WHITE,
-                strokeColor = Color.rgb(181, 196, 213),
-                radiusDp = 8
-            )
-            elevation = 18f
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(8.dp(), 0, 8.dp(), 8.dp())
         }
 
-        root.addView(buildSuggestionPopupHeader())
+        val tail = View(this).apply {
+            background = roundedDrawable(
+                color = PANEL_SURFACE,
+                strokeColor = PANEL_SURFACE,
+                radiusDp = 2
+            )
+            rotation = 45f
+            elevation = 16f
+            layoutParams = LinearLayout.LayoutParams(18.dp(), 18.dp()).apply {
+                bottomMargin = (-7).dp()
+            }
+        }
+
+        val bubble = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(12.dp(), 12.dp(), 12.dp(), 12.dp())
+            background = roundedDrawable(
+                color = PANEL_SURFACE,
+                strokeColor = PANEL_BORDER,
+                radiusDp = 12
+            )
+            elevation = 18f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        bubble.addView(buildSuggestionPopupHeader())
 
         val scroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -342,12 +374,20 @@ class CaptureService : Service() {
             orientation = LinearLayout.VERTICAL
         }
 
-        suggestionPopupState.suggestions.forEach { suggestion ->
-            content.addView(suggestionCard(suggestion, ::copyPopupSuggestion))
+        suggestionPopupState.suggestions.forEachIndexed { index, suggestion ->
+            content.addView(
+                suggestionCard(
+                    suggestion = suggestion,
+                    onCopy = ::copyPopupSuggestion,
+                    animationDelayMs = 120L + index * 70L
+                )
+            )
         }
 
         scroll.addView(content)
-        root.addView(scroll)
+        bubble.addView(scroll)
+        root.addView(tail)
+        root.addView(bubble)
         return root
     }
 
@@ -356,6 +396,7 @@ class CaptureService : Service() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 0, 0, 8.dp())
+            setOnTouchListener(SuggestionPopupTouchListener())
         }
 
         val titleColumn = LinearLayout(this).apply {
@@ -366,8 +407,8 @@ class CaptureService : Service() {
         titleColumn.addView(
             TextView(this).apply {
                 text = suggestionPopupState.title
-                textSize = 15f
-                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                textSize = 15.5f
+                setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
                 setTextColor(PANEL_TEXT)
                 includeFontPadding = false
             }
@@ -377,6 +418,7 @@ class CaptureService : Service() {
                 text = "${suggestionPopupState.suggestions.size} suggestions"
                 textSize = 11f
                 setTextColor(PANEL_MUTED_TEXT)
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
                 includeFontPadding = false
             }
         )
@@ -401,19 +443,26 @@ class CaptureService : Service() {
         }
 
         return TextView(this).apply {
-            text = if (countText.isBlank()) "RA" else "RA\n$countText"
+            text = when {
+                floatingPanelState.isBusy -> "AI\n..."
+                countText.isBlank() -> "RA"
+                else -> "RA\n$countText"
+            }
             textSize = if (countText.isBlank()) 15f else 13f
-            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             includeFontPadding = false
             background = roundedDrawable(
                 color = PANEL_ACCENT,
-                strokeColor = Color.rgb(12, 70, 132),
-                radiusDp = 8
+                strokeColor = PANEL_ACCENT_DARK,
+                radiusDp = 14
             )
             elevation = 12f
             contentDescription = "Reply Assistant panel"
+            if (floatingPanelState.isBusy) {
+                startBusyPulseOnAttach(this)
+            }
             setOnTouchListener(
                 FloatingOverlayTouchListener {
                     floatingPanelExpanded = true
@@ -426,11 +475,11 @@ class CaptureService : Service() {
     private fun buildExpandedPanelView(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(10.dp(), 10.dp(), 10.dp(), 10.dp())
+            setPadding(12.dp(), 12.dp(), 12.dp(), 12.dp())
             background = roundedDrawable(
-                color = Color.WHITE,
-                strokeColor = Color.rgb(194, 204, 216),
-                radiusDp = 8
+                color = PANEL_SURFACE,
+                strokeColor = PANEL_BORDER,
+                radiusDp = 12
             )
             elevation = 16f
         }
@@ -466,8 +515,8 @@ class CaptureService : Service() {
         titleColumn.addView(
             TextView(this).apply {
                 text = "Reply Assistant"
-                textSize = 15f
-                setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                textSize = 15.5f
+                setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
                 setTextColor(PANEL_TEXT)
                 includeFontPadding = false
             }
@@ -477,6 +526,7 @@ class CaptureService : Service() {
                 text = detailText
                 textSize = 11f
                 setTextColor(PANEL_MUTED_TEXT)
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
                 includeFontPadding = false
             }
         )
@@ -510,16 +560,13 @@ class CaptureService : Service() {
     }
 
     private fun buildStatusView(): View {
-        return TextView(this).apply {
-            text = floatingPanelState.statusMessage
-            textSize = 12f
-            setTextColor(PANEL_TEXT)
-            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
-            maxLines = 3
-            ellipsize = TextUtils.TruncateAt.END
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(9.dp(), 8.dp(), 9.dp(), 8.dp())
             background = roundedDrawable(
-                color = if (floatingPanelState.isBusy) Color.rgb(232, 241, 255) else Color.rgb(244, 247, 250),
-                strokeColor = if (floatingPanelState.isBusy) Color.rgb(159, 190, 236) else Color.rgb(224, 230, 238),
+                color = if (floatingPanelState.isBusy) PANEL_ACCENT_SOFT else PANEL_SUBTLE,
+                strokeColor = if (floatingPanelState.isBusy) PANEL_ACCENT_LIGHT else PANEL_BORDER,
                 radiusDp = 8
             )
             layoutParams = LinearLayout.LayoutParams(
@@ -529,6 +576,28 @@ class CaptureService : Service() {
                 bottomMargin = 8.dp()
             }
         }
+
+        container.addView(
+            TextView(this).apply {
+                text = floatingPanelState.statusMessage
+                textSize = 12f
+                setTextColor(PANEL_TEXT)
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+                maxLines = 3
+                ellipsize = TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f
+                )
+            }
+        )
+
+        if (floatingPanelState.isBusy) {
+            container.addView(loadingDots())
+        }
+
+        return container
     }
 
     private fun buildActionRows(): View {
@@ -591,8 +660,14 @@ class CaptureService : Service() {
             content.addView(emptyText(emptyState))
         } else {
             content.addView(sectionTitle("Replies"))
-            floatingPanelState.suggestions.forEach { suggestion ->
-                content.addView(suggestionCard(suggestion, ::copyFloatingSuggestion))
+            floatingPanelState.suggestions.forEachIndexed { index, suggestion ->
+                content.addView(
+                    suggestionCard(
+                        suggestion = suggestion,
+                        onCopy = ::copyFloatingSuggestion,
+                        animationDelayMs = index * 60L
+                    )
+                )
             }
         }
 
@@ -600,13 +675,17 @@ class CaptureService : Service() {
         return scroll
     }
 
-    private fun suggestionCard(suggestion: String, onCopy: (String) -> Unit): View {
+    private fun suggestionCard(
+        suggestion: String,
+        onCopy: (String) -> Unit,
+        animationDelayMs: Long = 0L
+    ): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(8.dp(), 7.dp(), 8.dp(), 7.dp())
+            setPadding(10.dp(), 9.dp(), 10.dp(), 9.dp())
             background = roundedDrawable(
-                color = Color.rgb(246, 250, 247),
-                strokeColor = Color.rgb(203, 226, 210),
+                color = PANEL_REPLY_SURFACE,
+                strokeColor = PANEL_REPLY_BORDER,
                 radiusDp = 8
             )
             layoutParams = LinearLayout.LayoutParams(
@@ -615,6 +694,20 @@ class CaptureService : Service() {
             ).apply {
                 bottomMargin = 7.dp()
             }
+            alpha = 0f
+            translationY = 10.dp().toFloat()
+            scaleX = 0.97f
+            scaleY = 0.97f
+            postDelayed({
+                animate()
+                    .alpha(1f)
+                    .translationY(0f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(220L)
+                    .setInterpolator(OvershootInterpolator(1.1f))
+                    .start()
+            }, animationDelayMs)
         }
 
         card.addView(
@@ -622,6 +715,7 @@ class CaptureService : Service() {
                 text = suggestion
                 textSize = 13f
                 setTextColor(PANEL_TEXT)
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
                 maxLines = 4
                 ellipsize = TextUtils.TruncateAt.END
             }
@@ -631,9 +725,16 @@ class CaptureService : Service() {
                 text = "Copy"
                 textSize = 11f
                 setAllCaps(false)
+                setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+                setTextColor(PANEL_ACCENT_DARK)
+                background = roundedDrawable(
+                    color = PANEL_ACCENT_SOFT,
+                    strokeColor = PANEL_ACCENT_LIGHT,
+                    radiusDp = 8
+                )
                 minHeight = 0
                 minimumHeight = 0
-                setPadding(8.dp(), 0, 8.dp(), 0)
+                setPadding(10.dp(), 0, 10.dp(), 0)
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     32.dp()
@@ -671,7 +772,7 @@ class CaptureService : Service() {
         return TextView(this).apply {
             text = title
             textSize = 12f
-            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
             setTextColor(PANEL_TEXT)
             setPadding(0, 6.dp(), 0, 5.dp())
         }
@@ -682,6 +783,7 @@ class CaptureService : Service() {
             text = textValue
             textSize = 11f
             setTextColor(PANEL_MUTED_TEXT)
+            typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             setPadding(8.dp(), 6.dp(), 8.dp(), 8.dp())
         }
     }
@@ -691,6 +793,13 @@ class CaptureService : Service() {
             text = label
             textSize = 11f
             setAllCaps(false)
+            setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+            setTextColor(PANEL_TEXT)
+            background = roundedDrawable(
+                color = PANEL_SUBTLE,
+                strokeColor = PANEL_BORDER,
+                radiusDp = 8
+            )
             minHeight = 0
             minimumHeight = 0
             setPadding(8.dp(), 0, 8.dp(), 0)
@@ -710,6 +819,13 @@ class CaptureService : Service() {
             textSize = 12f
             setAllCaps(false)
             isEnabled = enabled
+            setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+            setTextColor(if (enabled) Color.WHITE else PANEL_MUTED_TEXT)
+            background = roundedDrawable(
+                color = if (enabled) PANEL_ACCENT else Color.rgb(235, 238, 240),
+                strokeColor = if (enabled) PANEL_ACCENT_DARK else PANEL_BORDER,
+                radiusDp = 8
+            )
             minHeight = 0
             minimumHeight = 0
             setPadding(4.dp(), 0, 4.dp(), 0)
@@ -724,6 +840,112 @@ class CaptureService : Service() {
             }
             setOnClickListener { onClick() }
         }
+    }
+
+    private fun loadingDots(): View {
+        val dots = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(9.dp(), 0, 0, 0)
+        }
+
+        val animators = mutableListOf<ObjectAnimator>()
+        repeat(3) { index ->
+            val dot = View(this).apply {
+                alpha = 0.35f
+                scaleX = 0.78f
+                scaleY = 0.78f
+                background = roundedDrawable(
+                    color = PANEL_ACCENT,
+                    strokeColor = PANEL_ACCENT,
+                    radiusDp = 8
+                )
+                layoutParams = LinearLayout.LayoutParams(7.dp(), 7.dp()).apply {
+                    leftMargin = 3.dp()
+                }
+            }
+
+            dots.addView(dot)
+            listOf(
+                ObjectAnimator.ofFloat(dot, View.ALPHA, 0.35f, 1f),
+                ObjectAnimator.ofFloat(dot, View.SCALE_X, 0.78f, 1f),
+                ObjectAnimator.ofFloat(dot, View.SCALE_Y, 0.78f, 1f)
+            ).forEach { animator ->
+                animator.duration = 520L
+                animator.startDelay = index * 120L
+                animator.repeatCount = ValueAnimator.INFINITE
+                animator.repeatMode = ValueAnimator.REVERSE
+                animator.interpolator = AccelerateDecelerateInterpolator()
+                animators.add(animator)
+            }
+        }
+
+        dots.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(view: View) {
+                    animators.forEach { it.start() }
+                }
+
+                override fun onViewDetachedFromWindow(view: View) {
+                    animators.forEach { it.cancel() }
+                }
+            }
+        )
+
+        return dots
+    }
+
+    private fun startBusyPulseOnAttach(view: View) {
+        val pulse = AnimatorSet().apply {
+            playTogether(
+                ObjectAnimator.ofFloat(view, View.SCALE_X, 1f, 1.06f),
+                ObjectAnimator.ofFloat(view, View.SCALE_Y, 1f, 1.06f),
+                ObjectAnimator.ofFloat(view, View.ALPHA, 0.88f, 1f)
+            )
+            duration = 720L
+            interpolator = AccelerateDecelerateInterpolator()
+        }
+
+        val repeatPulse = object : Animator.AnimatorListener {
+            override fun onAnimationStart(animation: Animator) = Unit
+            override fun onAnimationCancel(animation: Animator) = Unit
+            override fun onAnimationRepeat(animation: Animator) = Unit
+
+            override fun onAnimationEnd(animation: Animator) {
+                if (view.isAttachedToWindow && floatingPanelState.isBusy) {
+                    pulse.start()
+                }
+            }
+        }
+
+        pulse.addListener(repeatPulse)
+        view.addOnAttachStateChangeListener(
+            object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(attachedView: View) {
+                    pulse.start()
+                }
+
+                override fun onViewDetachedFromWindow(detachedView: View) {
+                    pulse.cancel()
+                    pulse.removeListener(repeatPulse)
+                }
+            }
+        )
+    }
+
+    private fun animateSpeechBubblePopup(view: View) {
+        view.alpha = 0f
+        view.translationY = (-18).dp().toFloat()
+        view.scaleX = 0.92f
+        view.scaleY = 0.92f
+        view.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(280L)
+            .setInterpolator(OvershootInterpolator(1.08f))
+            .start()
     }
 
     private fun expandedPanelParams(x: Int, y: Int): WindowManager.LayoutParams {
@@ -757,16 +979,21 @@ class CaptureService : Service() {
     }
 
     private fun suggestionPopupParams(): WindowManager.LayoutParams {
+        val width = panelWidthPx()
+        val defaultX = ((resources.displayMetrics.widthPixels - width) / 2).coerceAtLeast(0)
+        val defaultY = SUGGESTION_POPUP_TOP_MARGIN_DP.dp()
+
         return WindowManager.LayoutParams(
-            panelWidthPx(),
+            width,
             ViewGroup.LayoutParams.WRAP_CONTENT,
             overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = SUGGESTION_POPUP_TOP_MARGIN_DP.dp()
+            gravity = Gravity.TOP or Gravity.START
+            x = suggestionPopupX ?: defaultX
+            y = suggestionPopupY ?: defaultY
         }
     }
 
@@ -924,6 +1151,52 @@ class CaptureService : Service() {
         }
     }
 
+    private inner class SuggestionPopupTouchListener : View.OnTouchListener {
+        private var initialX = 0
+        private var initialY = 0
+        private var initialTouchX = 0f
+        private var initialTouchY = 0f
+
+        override fun onTouch(view: View, event: MotionEvent): Boolean {
+            val activePopup = suggestionPopupView ?: return false
+            val params = activePopup.layoutParams as? WindowManager.LayoutParams ?: return false
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialX = params.x
+                    initialY = params.y
+                    initialTouchX = event.rawX
+                    initialTouchY = event.rawY
+                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                    return true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - initialTouchX).toInt()
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    val maxX = (resources.displayMetrics.widthPixels - panelWidthPx()).coerceAtLeast(0)
+                    val maxY = (resources.displayMetrics.heightPixels - 96.dp()).coerceAtLeast(0)
+                    params.x = (initialX + dx).coerceIn(0, maxX)
+                    params.y = (initialY + dy).coerceIn(0, maxY)
+                    suggestionPopupX = params.x
+                    suggestionPopupY = params.y
+                    windowManager?.updateViewLayout(activePopup, params)
+                    return true
+                }
+
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
+                    suggestionPopupX = params.x
+                    suggestionPopupY = params.y
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    return true
+                }
+            }
+
+            return false
+        }
+    }
+
     companion object {
         const val EXTRA_RESULT_CODE = "com.replyassistant.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "com.replyassistant.extra.RESULT_DATA"
@@ -941,9 +1214,17 @@ class CaptureService : Service() {
         private const val PANEL_WIDTH_DP = 340
         private const val PANEL_HEIGHT_DP = 400
         private const val SUGGESTION_POPUP_TOP_MARGIN_DP = 72
-        private val PANEL_ACCENT = Color.rgb(24, 96, 168)
-        private val PANEL_TEXT = Color.rgb(23, 33, 43)
-        private val PANEL_MUTED_TEXT = Color.rgb(89, 102, 116)
+        private val PANEL_SURFACE = Color.rgb(255, 255, 255)
+        private val PANEL_SUBTLE = Color.rgb(246, 248, 246)
+        private val PANEL_ACCENT = Color.rgb(15, 118, 110)
+        private val PANEL_ACCENT_DARK = Color.rgb(11, 79, 73)
+        private val PANEL_ACCENT_LIGHT = Color.rgb(181, 221, 214)
+        private val PANEL_ACCENT_SOFT = Color.rgb(232, 245, 239)
+        private val PANEL_BORDER = Color.rgb(225, 231, 226)
+        private val PANEL_REPLY_SURFACE = Color.rgb(251, 254, 252)
+        private val PANEL_REPLY_BORDER = Color.rgb(216, 232, 223)
+        private val PANEL_TEXT = Color.rgb(17, 24, 39)
+        private val PANEL_MUTED_TEXT = Color.rgb(101, 113, 126)
     }
 }
 

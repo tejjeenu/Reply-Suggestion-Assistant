@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">Reply Assistant</string>
-    <string name="accessibility_service_description">Detects scroll events in supported messaging apps so Reply Assistant can capture user-approved screen context in the background.</string>
+    <string name="accessibility_service_description">Detects supported messaging apps and scroll events so Reply Assistant can offer user-approved background reply suggestions.</string>
 </resources>
