@@ -8,3 +8,8 @@ app design principles:
 
 - innovative, aesthetic, useful, unobtrusive, honest, long lasting, thorough, environmentally friendly, little design as possible
 - make it easy to collect feedback from users
+
+Unique proposition:
+
+- Understanding what and how my app will be unique and better than others
+- getting it tested from others (usertesting.com is a good website)
