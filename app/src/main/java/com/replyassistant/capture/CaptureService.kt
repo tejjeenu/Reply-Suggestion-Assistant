@@ -442,34 +442,94 @@ class CaptureService : Service() {
             else -> ""
         }
 
-        return TextView(this).apply {
-            text = when {
-                floatingPanelState.isBusy -> "AI\n..."
-                countText.isBlank() -> "RA"
-                else -> "RA\n$countText"
-            }
-            textSize = if (countText.isBlank()) 15f else 13f
-            setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            includeFontPadding = false
-            background = roundedDrawable(
-                color = PANEL_ACCENT,
-                strokeColor = PANEL_ACCENT_DARK,
-                radiusDp = 14
-            )
-            elevation = 12f
+        val tile = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(5.dp(), 4.dp(), 5.dp(), 7.dp())
             contentDescription = "Reply Assistant panel"
-            if (floatingPanelState.isBusy) {
-                startBusyPulseOnAttach(this)
-            }
             setOnTouchListener(
                 FloatingOverlayTouchListener {
-                    floatingPanelExpanded = true
-                    renderFloatingControl()
+                    animateCompactBubbleExpansion(this) {
+                        floatingPanelExpanded = true
+                        renderFloatingControl()
+                    }
                 }
             )
         }
+
+        val bubble = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(11.dp(), 7.dp(), 11.dp(), 7.dp())
+            background = roundedDrawable(
+                color = PANEL_ACCENT,
+                strokeColor = PANEL_ACCENT_DARK,
+                radiusDp = 22
+            )
+            elevation = 12f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                54.dp()
+            )
+        }
+
+        bubble.addView(
+            TextView(this).apply {
+                text = "RA"
+                textSize = 14.5f
+                setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+            }
+        )
+
+        val detailText = when {
+            floatingPanelState.isBusy -> "..."
+            countText.isNotBlank() -> countText
+            else -> ""
+        }
+        if (detailText.isNotBlank()) {
+            bubble.addView(
+                TextView(this).apply {
+                    text = detailText
+                    textSize = 10.5f
+                    setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
+                    setTextColor(Color.rgb(214, 244, 238))
+                    gravity = Gravity.CENTER
+                    includeFontPadding = false
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        topMargin = 2.dp()
+                    }
+                }
+            )
+        }
+
+        val tail = View(this).apply {
+            background = roundedDrawable(
+                color = PANEL_ACCENT,
+                strokeColor = PANEL_ACCENT_DARK,
+                radiusDp = 3
+            )
+            rotation = 45f
+            elevation = 11f
+            layoutParams = LinearLayout.LayoutParams(17.dp(), 17.dp()).apply {
+                topMargin = (-8).dp()
+            }
+        }
+
+        tile.addView(bubble)
+        tile.addView(tail)
+
+        if (floatingPanelState.isBusy) {
+            startBusyPulseOnAttach(bubble)
+        }
+        animateCompactSpeechBubbleIn(tile)
+
+        return tile
     }
 
     private fun buildExpandedPanelView(): View {
@@ -948,6 +1008,32 @@ class CaptureService : Service() {
             .start()
     }
 
+    private fun animateCompactSpeechBubbleIn(view: View) {
+        view.alpha = 0f
+        view.translationY = 10.dp().toFloat()
+        view.scaleX = 0.74f
+        view.scaleY = 0.74f
+        view.animate()
+            .alpha(1f)
+            .translationY(0f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(260L)
+            .setInterpolator(OvershootInterpolator(1.18f))
+            .start()
+    }
+
+    private fun animateCompactBubbleExpansion(view: View, onEnd: () -> Unit) {
+        view.animate()
+            .alpha(0f)
+            .scaleX(1.2f)
+            .scaleY(1.2f)
+            .setDuration(150L)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .withEndAction(onEnd)
+            .start()
+    }
+
     private fun expandedPanelParams(x: Int, y: Int): WindowManager.LayoutParams {
         return WindowManager.LayoutParams(
             panelWidthPx(),
@@ -965,8 +1051,8 @@ class CaptureService : Service() {
 
     private fun compactTileParams(x: Int, y: Int): WindowManager.LayoutParams {
         return WindowManager.LayoutParams(
-            FLOATING_CONTROL_SIZE_PX,
-            FLOATING_CONTROL_SIZE_PX,
+            COMPACT_BUBBLE_WIDTH_DP.dp(),
+            COMPACT_BUBBLE_HEIGHT_DP.dp(),
             overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
@@ -1207,7 +1293,8 @@ class CaptureService : Service() {
         private const val CAPTURE_RETRY_DELAY_MS = 120L
         private const val NOTIFICATION_ID = 42
         private const val NOTIFICATION_CHANNEL_ID = "screen_capture"
-        private const val FLOATING_CONTROL_SIZE_PX = 144
+        private const val COMPACT_BUBBLE_WIDTH_DP = 88
+        private const val COMPACT_BUBBLE_HEIGHT_DP = 76
         private const val FLOATING_CONTROL_INITIAL_X = 24
         private const val FLOATING_CONTROL_INITIAL_Y = 220
         private const val DRAG_SLOP_PX = 8
