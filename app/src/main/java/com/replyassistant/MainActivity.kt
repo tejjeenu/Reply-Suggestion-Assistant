@@ -145,6 +145,7 @@ class MainActivity : ComponentActivity() {
     private var autoScrollSessionId = 0
     private var lastAutoScrollAt = 0L
     private var lastAutoCaptureAt = 0L
+    private var lastSuggestionPopupShownAt = 0L
     private var autoCaptureSequence = 0
     private var promptedBackgroundStartRequested = false
     private var pendingStartBackgroundAfterCapture = false
@@ -526,6 +527,10 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        if (isWithinSuggestionPopupGracePeriod(now)) {
+            return
+        }
+
         if (!autoScrollSessionActive) {
             startAutoScrollSession(appName)
         }
@@ -534,6 +539,7 @@ class MainActivity : ComponentActivity() {
         lastAutoScrollAt = now
         sourceApp = appName
         captureService?.hideSuggestionPopup()
+        lastSuggestionPopupShownAt = 0L
 
         if (!autoCaptureInFlight && now - lastAutoCaptureAt >= AUTO_CAPTURE_SAMPLE_INTERVAL_MS) {
             captureAutoScrollFrame(appName)
@@ -650,6 +656,9 @@ class MainActivity : ComponentActivity() {
                 title = "Reply suggestions",
                 suggestions = nextSuggestions
             ) ?: false
+            if (popupShown) {
+                lastSuggestionPopupShownAt = SystemClock.elapsedRealtime()
+            }
             updateStatus(
                 if (popupShown) {
                     "Suggestions shown for $appName."
@@ -671,7 +680,13 @@ class MainActivity : ComponentActivity() {
         autoSuggestionInFlight = false
         lastAutoScrollAt = 0L
         lastAutoCaptureAt = 0L
+        lastSuggestionPopupShownAt = 0L
         autoCaptureSequence = 0
+    }
+
+    private fun isWithinSuggestionPopupGracePeriod(now: Long): Boolean {
+        val shownAt = lastSuggestionPopupShownAt
+        return shownAt > 0L && now - shownAt < SUGGESTION_POPUP_SCROLL_GRACE_MS
     }
 
     private fun requestScreenCapture() {
@@ -935,6 +950,7 @@ class MainActivity : ComponentActivity() {
         private const val AUTO_CAPTURE_SETTLE_DELAY_MS = 350L
         private const val AUTO_CAPTURE_SAMPLE_INTERVAL_MS = 900L
         private const val AUTO_SCROLL_STOP_QUIET_MS = 1_400L
+        private const val SUGGESTION_POPUP_SCROLL_GRACE_MS = 1_500L
         private const val MAX_AUTO_CAPTURE_HISTORY = 5
     }
 }

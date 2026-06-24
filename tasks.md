@@ -13,3 +13,8 @@ Unique proposition:
 
 - Understanding what and how my app will be unique and better than others
 - getting it tested from others (usertesting.com is a good website)
+
+- making the app likeable by everyone is not necessarily a great idea since some people with a lot of hate
+will in theory also drive the popularity of the product as well
+
+- accessibility scross debounce can control how realistic the movement is

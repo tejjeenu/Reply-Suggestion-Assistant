@@ -68,7 +68,7 @@ class MessagingAccessibilityService : AccessibilityService() {
     }
 
     companion object {
-        private const val ACCESSIBILITY_SCROLL_DEBOUNCE_MS = 650L
+        private const val ACCESSIBILITY_SCROLL_DEBOUNCE_MS = 150L
         private const val FOREGROUND_DEBOUNCE_MS = 2_000L
     }
 }
