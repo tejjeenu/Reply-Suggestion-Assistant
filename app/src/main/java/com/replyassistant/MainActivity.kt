@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Base64
 import androidx.activity.ComponentActivity
@@ -48,6 +49,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Schedule
@@ -93,13 +95,19 @@ import com.replyassistant.accessibility.MessagingAssistantPrompt
 import com.replyassistant.accessibility.MessagingAccessibilityService
 import com.replyassistant.accessibility.MessagingScrollMonitor
 import com.replyassistant.capture.CaptureService
+import com.replyassistant.chat.AutomaticConversationMemory
+import com.replyassistant.chat.WhatsAppChatContext
+import com.replyassistant.chat.WhatsAppChatParser
 import com.replyassistant.network.SuggestionApi
 import com.replyassistant.network.SuggestionImage
 import com.replyassistant.network.SuggestionRequest
 import com.replyassistant.ocr.OcrProcessor
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import kotlin.coroutines.resume
@@ -122,6 +130,7 @@ private enum class PromptPermission {
 class MainActivity : ComponentActivity() {
     private val ocrProcessor = OcrProcessor()
     private val captures = mutableStateListOf<CapturedText>()
+    private lateinit var conversationMemoryStore: AutomaticConversationMemory
 
     private var captureService: CaptureService? = null
     private var isBound by mutableStateOf(false)
@@ -131,8 +140,13 @@ class MainActivity : ComponentActivity() {
     private var backendUrl by mutableStateOf(
         SuggestionApi.normalizeSuggestEndpoint(BuildConfig.DEFAULT_BACKEND_URL)
     )
-    private var sourceApp by mutableStateOf("Current app")
+    private var sourceApp by mutableStateOf("WhatsApp")
     private var tone by mutableStateOf("casual, natural, helpful")
+    private var importedChat by mutableStateOf<WhatsAppChatContext?>(null)
+    private var chatUserName by mutableStateOf("")
+    private var conversationName by mutableStateOf("")
+    private var automaticMemoryEnabled by mutableStateOf(false)
+    private var automaticMemoryCount by mutableStateOf(0)
     private var floatingControlEnabled by mutableStateOf(false)
     private var autoAssistantEnabled by mutableStateOf(false)
     private var overlayPermissionGranted by mutableStateOf(false)
@@ -150,7 +164,13 @@ class MainActivity : ComponentActivity() {
     private var promptedBackgroundStartRequested = false
     private var pendingStartBackgroundAfterCapture = false
     private var promptWaitingForPermission: PromptPermission? = null
-    private var pendingPromptSourceApp = "Current app"
+    private var pendingPromptSourceApp = "WhatsApp"
+
+    private val chatImportLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) importWhatsAppChat(uri)
+    }
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -238,6 +258,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        conversationMemoryStore = AutomaticConversationMemory(this)
+        restoreAutomaticMemorySettings()
+        restoreImportedChat()
         refreshOverlayPermissionStatus()
         refreshAccessibilityPermissionStatus()
         requestNotificationPermissionIfNeeded()
@@ -257,8 +280,19 @@ class MainActivity : ComponentActivity() {
                     captures = captures,
                     contextDraft = contextDraft,
                     suggestions = suggestions,
+                    importedChat = importedChat,
+                    chatUserName = chatUserName,
+                    conversationName = conversationName,
+                    automaticMemoryEnabled = automaticMemoryEnabled,
+                    automaticMemoryCount = automaticMemoryCount,
                     onBackendUrlChange = { backendUrl = it },
                     onToneChange = { tone = it },
+                    onImportChat = { chatImportLauncher.launch(arrayOf("text/plain")) },
+                    onRemoveChat = ::removeImportedChat,
+                    onChatUserNameChange = ::updateChatUserName,
+                    onConversationNameChange = ::updateConversationName,
+                    onAutomaticMemoryChange = ::updateAutomaticMemoryEnabled,
+                    onClearAutomaticMemory = ::clearAutomaticMemory,
                     onRequestOverlayPermission = ::requestOverlayPermission,
                     onRequestAccessibilityPermission = ::requestAccessibilityPermission,
                     onAutoAssistantChange = ::updateAutoAssistantEnabled,
@@ -291,7 +325,7 @@ class MainActivity : ComponentActivity() {
         }
         if (autoAssistantEnabled && !accessibilityPermissionGranted) {
             updateAutoAssistantEnabled(false)
-            updateStatus("Background assistant stopped because messaging detection is disabled.")
+            updateStatus("Background assistant stopped because WhatsApp detection is disabled.")
         }
         resumePromptedBackgroundStartIfNeeded()
     }
@@ -351,12 +385,12 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != MessagingAssistantPrompt.ACTION_START_BACKGROUND_ASSISTANT) return
 
         pendingPromptSourceApp = intent.getStringExtra(MessagingAssistantPrompt.EXTRA_SOURCE_APP)
-            ?: "Current app"
+            ?: "WhatsApp"
         sourceApp = pendingPromptSourceApp
         promptedBackgroundStartRequested = true
         promptWaitingForPermission = null
         MessagingAssistantPrompt.dismiss(this)
-        updateStatus("Start Reply Assistant for $pendingPromptSourceApp.")
+        updateStatus("Start WhatsApp Reply Assistant for $pendingPromptSourceApp.")
         continuePromptedBackgroundStart()
     }
 
@@ -369,7 +403,7 @@ class MainActivity : ComponentActivity() {
         when (waitingFor) {
             PromptPermission.ACCESSIBILITY -> {
                 if (!accessibilityPermissionGranted) {
-                    updateStatus("Enable Reply Assistant in Accessibility settings to show prompts in messaging apps.")
+                    updateStatus("Enable WhatsApp Reply Assistant in Accessibility settings to detect WhatsApp.")
                     return
                 }
             }
@@ -425,12 +459,12 @@ class MainActivity : ComponentActivity() {
             Uri.parse("package:$packageName")
         )
         startActivity(intent)
-        updateStatus("Enable display-over-other-apps permission, then return to Reply Assistant.")
+        updateStatus("Enable display-over-other-apps permission, then return to WhatsApp Reply Assistant.")
     }
 
     private fun requestAccessibilityPermission() {
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        updateStatus("Enable Reply Assistant in Accessibility settings, then return.")
+        updateStatus("Enable WhatsApp Reply Assistant in Accessibility settings, then return.")
     }
 
     private fun updateFloatingControlEnabled(enabled: Boolean) {
@@ -503,7 +537,7 @@ class MainActivity : ComponentActivity() {
             AssistantSessionState.setBackgroundAssistantActive(this, true)
             MessagingAssistantPrompt.dismiss(this)
             MessagingScrollMonitor.register(messagingScrollListener)
-            updateStatus("Background assistant active. Open a supported messaging app and scroll.")
+            updateStatus("Background assistant active. Open WhatsApp and scroll the conversation.")
             moveTaskToBack(true)
         } else {
             autoAssistantEnabled = false
@@ -791,6 +825,12 @@ class MainActivity : ComponentActivity() {
                                         imageBase64 = imageForVision?.base64
                                     )
                                     captures.add(capture)
+                                    if (automaticMemoryEnabled && cleanedText.isNotBlank()) {
+                                        automaticMemoryCount = conversationMemoryStore.append(
+                                            conversationName = conversationName,
+                                            visibleText = cleanedText
+                                        ).snapshotCount
+                                    }
                                     contextDraft = buildContextDraft()
                                     updateSuggestions(emptyList())
                                     syncFloatingPanelState()
@@ -870,10 +910,161 @@ class MainActivity : ComponentActivity() {
                     sourceApp = sourceApp,
                     tone = tone,
                     contextText = contextText,
+                    chatHistory = importedChat?.historyExcerpt.orEmpty(),
+                    chatParticipants = importedChat?.participants.orEmpty(),
+                    userName = chatUserName.trim(),
+                    conversationName = conversationName.trim(),
+                    automaticHistory = conversationMemoryStore.load(conversationName).history,
                     images = captures.takeLast(5).mapNotNull { it.toSuggestionImage() }
                 )
             )
         }
+    }
+
+    private fun importWhatsAppChat(uri: Uri) {
+        updateBusy(true)
+        updateStatus("Importing WhatsApp chat...")
+        lifecycleScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val fileName = displayNameFor(uri)
+                    val rawText = contentResolver.openInputStream(uri)?.use { input ->
+                        val reader = input.bufferedReader(Charsets.UTF_8)
+                        val output = StringBuilder()
+                        val buffer = CharArray(8_192)
+                        while (true) {
+                            val count = reader.read(buffer)
+                            if (count < 0) break
+                            output.append(buffer, 0, count)
+                            if (output.length > MAX_IMPORT_CHARS) {
+                                throw IOException("This export is too large. Keep the .txt file under 12 MB.")
+                            }
+                        }
+                        output.toString()
+                    } ?: throw IOException("Could not open the selected file.")
+                    WhatsAppChatParser.parse(fileName, rawText)
+                }
+            }
+
+            result.onSuccess { chat ->
+                importedChat = chat
+                if (chatUserName !in chat.participants) chatUserName = ""
+                saveImportedChat(chat)
+                updateStatus("Imported ${chat.messageCount} WhatsApp messages. Choose your name in the export.")
+            }.onFailure { error ->
+                updateStatus("Chat import failed: ${error.message}")
+            }
+            updateBusy(false)
+        }
+    }
+
+    private fun displayNameFor(uri: Uri): String {
+        return contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+            ?: uri.lastPathSegment
+            ?: "WhatsApp chat.txt"
+    }
+
+    private fun updateChatUserName(value: String) {
+        chatUserName = value
+        if (conversationName.isBlank()) {
+            val otherParticipant = importedChat?.participants?.firstOrNull { participant ->
+                !participant.equals(value.trim(), ignoreCase = true)
+            }
+            if (!otherParticipant.isNullOrBlank()) {
+                updateConversationName(otherParticipant)
+            }
+        }
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CHAT_USER_NAME, value)
+            .apply()
+    }
+
+    private fun updateConversationName(value: String) {
+        conversationName = value
+        automaticMemoryCount = conversationMemoryStore.load(value).snapshotCount
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CONVERSATION_NAME, value)
+            .apply()
+    }
+
+    private fun updateAutomaticMemoryEnabled(enabled: Boolean) {
+        if (enabled && conversationName.isBlank()) {
+            updateStatus("Name this WhatsApp conversation before enabling automatic memory.")
+            return
+        }
+        automaticMemoryEnabled = enabled
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTOMATIC_MEMORY_ENABLED, enabled)
+            .apply()
+        updateStatus(
+            if (enabled) {
+                "Automatic memory enabled for $conversationName. Viewed WhatsApp context will be stored locally."
+            } else {
+                "Automatic memory paused. Existing local context is still available."
+            }
+        )
+    }
+
+    private fun clearAutomaticMemory() {
+        conversationMemoryStore.clear(conversationName)
+        automaticMemoryCount = 0
+        updateStatus("Automatic memory cleared for $conversationName.")
+    }
+
+    private fun removeImportedChat() {
+        importedChat = null
+        chatUserName = ""
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_CHAT_FILE_NAME)
+            .remove(KEY_CHAT_PARTICIPANTS)
+            .remove(KEY_CHAT_MESSAGE_COUNT)
+            .remove(KEY_CHAT_HISTORY)
+            .remove(KEY_CHAT_USER_NAME)
+            .apply()
+        updateStatus("Imported WhatsApp chat removed from this app.")
+    }
+
+    private fun saveImportedChat(chat: WhatsAppChatContext) {
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CHAT_FILE_NAME, chat.fileName)
+            .putString(KEY_CHAT_PARTICIPANTS, JSONArray(chat.participants).toString())
+            .putInt(KEY_CHAT_MESSAGE_COUNT, chat.messageCount)
+            .putString(KEY_CHAT_HISTORY, chat.historyExcerpt)
+            .putString(KEY_CHAT_USER_NAME, chatUserName)
+            .apply()
+    }
+
+    private fun restoreImportedChat() {
+        val prefs = getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+        val history = prefs.getString(KEY_CHAT_HISTORY, "").orEmpty()
+        if (history.isBlank()) return
+        val participantJson = prefs.getString(KEY_CHAT_PARTICIPANTS, "[]").orEmpty()
+        val participants = runCatching {
+            val array = JSONArray(participantJson)
+            List(array.length()) { index -> array.getString(index) }
+        }.getOrDefault(emptyList())
+        importedChat = WhatsAppChatContext(
+            fileName = prefs.getString(KEY_CHAT_FILE_NAME, "WhatsApp chat.txt").orEmpty(),
+            participants = participants,
+            messageCount = prefs.getInt(KEY_CHAT_MESSAGE_COUNT, 0),
+            historyExcerpt = history
+        )
+        chatUserName = prefs.getString(KEY_CHAT_USER_NAME, "").orEmpty()
+    }
+
+    private fun restoreAutomaticMemorySettings() {
+        val prefs = getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+        conversationName = prefs.getString(KEY_CONVERSATION_NAME, "").orEmpty()
+        automaticMemoryEnabled = prefs.getBoolean(KEY_AUTOMATIC_MEMORY_ENABLED, false)
+        automaticMemoryCount = conversationMemoryStore.load(conversationName).snapshotCount
     }
 
     private fun removeCapture(id: Long) {
@@ -947,6 +1138,15 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        private const val CHAT_PREFS_NAME = "whatsapp_chat_context"
+        private const val KEY_CHAT_FILE_NAME = "file_name"
+        private const val KEY_CHAT_PARTICIPANTS = "participants"
+        private const val KEY_CHAT_MESSAGE_COUNT = "message_count"
+        private const val KEY_CHAT_HISTORY = "history"
+        private const val KEY_CHAT_USER_NAME = "user_name"
+        private const val KEY_CONVERSATION_NAME = "conversation_name"
+        private const val KEY_AUTOMATIC_MEMORY_ENABLED = "automatic_memory_enabled"
+        private const val MAX_IMPORT_CHARS = 12_000_000
         private const val AUTO_CAPTURE_SETTLE_DELAY_MS = 350L
         private const val AUTO_CAPTURE_SAMPLE_INTERVAL_MS = 900L
         private const val AUTO_SCROLL_STOP_QUIET_MS = 1_400L
@@ -1081,8 +1281,19 @@ fun ReplyAssistantScreen(
     captures: List<CapturedText>,
     contextDraft: String,
     suggestions: List<String>,
+    importedChat: WhatsAppChatContext?,
+    chatUserName: String,
+    conversationName: String,
+    automaticMemoryEnabled: Boolean,
+    automaticMemoryCount: Int,
     onBackendUrlChange: (String) -> Unit,
     onToneChange: (String) -> Unit,
+    onImportChat: () -> Unit,
+    onRemoveChat: () -> Unit,
+    onChatUserNameChange: (String) -> Unit,
+    onConversationNameChange: (String) -> Unit,
+    onAutomaticMemoryChange: (Boolean) -> Unit,
+    onClearAutomaticMemory: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onRequestAccessibilityPermission: () -> Unit,
     onAutoAssistantChange: (Boolean) -> Unit,
@@ -1110,6 +1321,23 @@ fun ReplyAssistantScreen(
                     statusMessage = statusMessage,
                     isBusy = isBusy,
                     autoAssistantEnabled = autoAssistantEnabled
+                )
+            }
+
+            item {
+                WhatsAppChatPanel(
+                    importedChat = importedChat,
+                    chatUserName = chatUserName,
+                    conversationName = conversationName,
+                    automaticMemoryEnabled = automaticMemoryEnabled,
+                    automaticMemoryCount = automaticMemoryCount,
+                    isBusy = isBusy,
+                    onImportChat = onImportChat,
+                    onRemoveChat = onRemoveChat,
+                    onChatUserNameChange = onChatUserNameChange,
+                    onConversationNameChange = onConversationNameChange,
+                    onAutomaticMemoryChange = onAutomaticMemoryChange,
+                    onClearAutomaticMemory = onClearAutomaticMemory
                 )
             }
 
@@ -1222,12 +1450,12 @@ private fun Header(statusMessage: String, isBusy: Boolean, autoAssistantEnabled:
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Reply Assistant",
+                        text = "WhatsApp Reply Assistant",
                         style = MaterialTheme.typography.headlineSmall,
                         color = AppInk
                     )
                     Text(
-                        text = if (autoAssistantEnabled) "Background mode" else "On-device capture",
+                        text = if (autoAssistantEnabled) "Watching WhatsApp scrolls" else "WhatsApp companion",
                         style = MaterialTheme.typography.bodySmall,
                         color = AppMuted
                     )
@@ -1268,6 +1496,128 @@ private fun Header(statusMessage: String, isBusy: Boolean, autoAssistantEnabled:
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WhatsAppChatPanel(
+    importedChat: WhatsAppChatContext?,
+    chatUserName: String,
+    conversationName: String,
+    automaticMemoryEnabled: Boolean,
+    automaticMemoryCount: Int,
+    isBusy: Boolean,
+    onImportChat: () -> Unit,
+    onRemoveChat: () -> Unit,
+    onChatUserNameChange: (String) -> Unit,
+    onConversationNameChange: (String) -> Unit,
+    onAutomaticMemoryChange: (Boolean) -> Unit,
+    onClearAutomaticMemory: () -> Unit
+) {
+    Surface(
+        color = AppSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        shadowElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Automatic conversation memory", style = MaterialTheme.typography.titleMedium, color = AppInk)
+            Text(
+                "With your consent, text visible during WhatsApp captures is saved locally and reused for future replies. It cannot collect messages you never open.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = AppMuted
+            )
+            OutlinedTextField(
+                value = conversationName,
+                onValueChange = onConversationNameChange,
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                enabled = !automaticMemoryEnabled,
+                label = { Text("Conversation/contact name") },
+                placeholder = { Text("e.g. Alex") },
+                supportingText = { Text("Keeps automatically captured conversations separate.") }
+            )
+            Button(
+                onClick = { onAutomaticMemoryChange(!automaticMemoryEnabled) },
+                enabled = !isBusy && (automaticMemoryEnabled || conversationName.isNotBlank()),
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (automaticMemoryEnabled) AppInk else Color(0xFF25D366)
+                )
+            ) {
+                Text(if (automaticMemoryEnabled) "Pause automatic memory" else "I agree — enable automatic memory")
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    "$automaticMemoryCount saved context snapshot${if (automaticMemoryCount == 1) "" else "s"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppMuted
+                )
+                if (automaticMemoryCount > 0) {
+                    TextButton(onClick = onClearAutomaticMemory, enabled = !isBusy) {
+                        Text("Clear memory")
+                    }
+                }
+            }
+            HorizontalDivider(color = AppLine)
+            Text("Optional history import", style = MaterialTheme.typography.titleSmall, color = AppInk)
+            if (importedChat == null) {
+                Text(
+                    "To backfill messages you have not viewed in the app, import a WhatsApp .txt export without media.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AppMuted
+                )
+                Button(
+                    onClick = onImportChat,
+                    enabled = !isBusy,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366))
+                ) {
+                    Icon(Icons.Rounded.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Import WhatsApp chat")
+                }
+            } else {
+                Text(
+                    "${importedChat.fileName} · ${importedChat.messageCount} messages",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AppInk
+                )
+                Text(
+                    "Participants: ${importedChat.participants.joinToString().ifBlank { "Not detected" }}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppMuted
+                )
+                OutlinedTextField(
+                    value = chatUserName,
+                    onValueChange = onChatUserNameChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Your name in this export") },
+                    placeholder = { Text(importedChat.participants.firstOrNull().orEmpty()) },
+                    supportingText = {
+                        Text("This tells the assistant which past messages reflect your writing style.")
+                    }
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(onClick = onImportChat, enabled = !isBusy, modifier = Modifier.weight(1f)) {
+                        Text("Replace")
+                    }
+                    TextButton(onClick = onRemoveChat, enabled = !isBusy, modifier = Modifier.weight(1f)) {
+                        Text("Remove")
+                    }
+                }
+                Text(
+                    "Stored on this device. A limited text excerpt is sent only when you generate replies.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppMuted
+                )
             }
         }
     }

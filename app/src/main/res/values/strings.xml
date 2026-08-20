@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Reply Assistant</string>
-    <string name="accessibility_service_description">Detects supported messaging apps and scroll events so Reply Assistant can offer user-approved background reply suggestions.</string>
+    <string name="app_name">WhatsApp Reply Assistant</string>
+    <string name="accessibility_service_description">Detects WhatsApp scroll events so WhatsApp Reply Assistant can offer user-approved background reply suggestions.</string>
 </resources>

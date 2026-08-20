@@ -446,7 +446,7 @@ class CaptureService : Service() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(5.dp(), 4.dp(), 5.dp(), 7.dp())
-            contentDescription = "Reply Assistant panel"
+            contentDescription = "WhatsApp Reply Assistant panel"
             setOnTouchListener(
                 FloatingOverlayTouchListener {
                     animateCompactBubbleExpansion(this) {
@@ -574,7 +574,7 @@ class CaptureService : Service() {
 
         titleColumn.addView(
             TextView(this).apply {
-                text = "Reply Assistant"
+                text = "WhatsApp Reply Assistant"
                 textSize = 15.5f
                 setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
                 setTextColor(PANEL_TEXT)
@@ -1139,7 +1139,7 @@ class CaptureService : Service() {
 
         return builder
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("Reply Assistant")
+            .setContentTitle("WhatsApp Reply Assistant")
             .setContentText("Capturing screen context")
             .setOngoing(true)
             .build()

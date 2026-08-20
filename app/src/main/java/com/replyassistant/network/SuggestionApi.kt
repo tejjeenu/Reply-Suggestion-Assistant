@@ -12,6 +12,11 @@ data class SuggestionRequest(
     val sourceApp: String,
     val tone: String,
     val contextText: String,
+    val chatHistory: String = "",
+    val chatParticipants: List<String> = emptyList(),
+    val userName: String = "",
+    val conversationName: String = "",
+    val automaticHistory: String = "",
     val images: List<SuggestionImage> = emptyList()
 )
 
@@ -60,6 +65,11 @@ object SuggestionApi {
                 .put("source_app", request.sourceApp)
                 .put("tone", request.tone)
                 .put("context_text", request.contextText)
+                .put("chat_history", request.chatHistory)
+                .put("chat_participants", JSONArray(request.chatParticipants))
+                .put("user_name", request.userName)
+                .put("conversation_name", request.conversationName)
+                .put("automatic_history", request.automaticHistory)
 
             if (request.images.isNotEmpty()) {
                 val images = JSONArray()

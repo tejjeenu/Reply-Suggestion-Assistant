@@ -10,4 +10,6 @@ captures/
 app/build/
 backend/.env
 backend/.venv/
+__pycache__/
+*.pyc
 node_modules/

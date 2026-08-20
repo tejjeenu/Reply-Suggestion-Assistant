@@ -1,184 +1,125 @@
-# Reply Suggestion Assistant
+# WhatsApp Reply Assistant
 
-Android MVP for capturing user-approved screen context, extracting text with Google ML Kit OCR, and sending that text to a backend for reply suggestions.
+An Android companion for WhatsApp that automatically builds opt-in local conversation memory and uses it with the message currently on screen to suggest replies.
 
-## What Is Built
+This is not a WhatsApp plugin. WhatsApp does not provide a consumer plugin API that can read personal chats. The app instead uses Android's user-approved screen capture and a user-approved accessibility service that reacts only to WhatsApp and WhatsApp Business. A manual WhatsApp export remains available only as an optional way to backfill older messages.
 
-- Native Android app in Kotlin + Jetpack Compose.
-- User-approved `MediaProjection` screen capture session.
-- Foreground screen capture service with Android media projection service type.
-- Accessibility-based scroll detection for supported messaging apps.
-- Multiple manual screenshot captures per session.
-- Background assistant mode that samples screenshots during messaging-app scrolls.
-- Accessibility-based launch prompt when a supported messaging app is opened and the background assistant is not already running.
-- Closeable suggestion popup shown only when replies are ready, after explicit overlay permission.
-- On-device ML Kit OCR for each screenshot.
-- Optional two-stage Groq pipeline: Llama 4 Scout extracts screenshot/transcript context, then Llama 3.3 70B writes the final TextMaster AI reply options.
-- Editable context review before anything is sent out.
-- Reply suggestions through a backend URL, with local mock suggestions when the backend URL is blank.
-- Tiny FastAPI backend that can call Groq without putting `GROQ_API_KEY` inside the APK.
+## How it works
 
-## Android Setup
+1. Enter a label for the conversation/contact and explicitly enable **Automatic conversation memory**.
+2. Tap **Start Capture** and approve Android's screen-capture prompt.
+3. Enable WhatsApp detection and the suggestion popup when prompted.
+4. Tap **Run in Background**, open that WhatsApp conversation, and scroll normally.
+5. Text visible in user-approved captures is OCR'd and accumulated in app-private storage for that label.
+6. When scrolling stops, semantic retrieval selects the most relevant remembered context and the generative model returns three replies.
 
-Open this folder in Android Studio, let Gradle sync, then run the `app` configuration on a real Android phone.
+Automatic memory cannot recover messages that have never appeared on screen. To backfill them, scroll through older messages once or optionally use WhatsApp's **Export chat > Without media** and import the `.txt` file.
 
-The app uses:
+Automatic memory is bounded to 120 unique snapshots/100,000 characters per conversation label. Up to 80,000 characters are sent to the configured backend only when generating a reply. The backend uses a local BERT-family sentence encoder to select up to 16,000 characters of relevant context before calling Groq. Images and media are not added to long-term memory.
 
-- `compileSdk 35`
-- `minSdk 23`
-- Java 17
-- ML Kit text recognition: `com.google.mlkit:text-recognition:16.0.1`
+The name field matters: it tells the model which historical messages were written by you, so it can match your style instead of copying the other participant.
 
-On your phone:
+## What is built
 
-1. Enable Developer Options.
-2. Enable USB debugging.
-3. Connect the phone by USB.
-4. Run the app from Android Studio.
+- Kotlin + Jetpack Compose Android app (`minSdk 23`, `compileSdk 35`, Java 17).
+- Import support for common Android and iPhone WhatsApp `.txt` export formats, including multiline messages.
+- Opt-in automatic local memory built from viewed WhatsApp OCR context, with pause and clear controls.
+- Per-contact labels so automatically remembered conversations do not mix.
+- Semantic context retrieval with `sentence-transformers/all-MiniLM-L6-v2`, plus a lexical fallback.
+- Persisted participant names, message count, and bounded conversation excerpt.
+- WhatsApp-only accessibility detection (`com.whatsapp` and `com.whatsapp.w4b`).
+- User-approved MediaProjection capture and on-device ML Kit OCR.
+- Background scroll sampling and a closeable reply overlay.
+- FastAPI backend with an optional two-stage Groq vision/text pipeline.
+- API prompting that treats the current screen as the reply target and retrieved history as relationship and writing-style context.
+- Local mock suggestions when no backend URL is configured.
 
-## Install On Your Phone
+## Android setup
 
-The easiest route is Android Studio:
-
-1. Install Android Studio.
-2. Open this project folder.
-3. Let Android Studio install/sync the required Android SDK packages.
-4. Plug in your Android phone with USB debugging enabled.
-5. Select your phone in the device dropdown.
-6. Press Run.
-
-PowerShell install, once Android Studio has installed the SDK:
+Open this folder in Android Studio, let Gradle sync, then run the `app` configuration on a real Android phone. You can also install from PowerShell after the Android SDK is configured:
 
 ```powershell
 .\gradlew.bat installDebug
 ```
 
-The app will install as `Reply Assistant`.
+To run unit tests:
 
-## App Flow
+```powershell
+.\gradlew.bat testDebugUnitTest
+```
 
-1. Tap `Start Capture`.
-2. Approve Android's screen capture prompt.
-3. Tap `Enable Messaging Detection`, enable `Reply Assistant` in Android Accessibility settings, then return to the app.
-4. Tap `Allow Suggestion Popup`, grant display-over-other-apps permission, then return to the app.
-5. Tap `Run in Background`.
-6. Open a supported messaging app and scroll the conversation. Reply Assistant starts a capture session when scrolling is detected, samples screenshots while scrolling, waits until scrolling stops, sends the captured batch to the configured backend or local mock flow, and shows a closeable popup when suggestions are ready.
-7. Use `Copy` inside the popup to copy a reply, or `Close` to dismiss it.
-8. Open `Details` in the main app only when you need backend settings, manual capture fallback, or context review.
-9. Leave `Backend URL` blank for mock suggestions, or set it to your backend.
+Android requires fresh screen-capture approval for each capture session. The app cannot silently read WhatsApp messages or WhatsApp's private database. Accessibility access is used only to detect WhatsApp window and scroll events; `canRetrieveWindowContent` is disabled.
 
-After messaging detection is enabled, opening a supported messaging app while the assistant is not running can show a `Use Reply Assistant` notification. Tapping it opens the app, requests any missing permissions, starts Android's screen-capture consent flow, and then runs the background assistant.
+## Backend setup
 
-Supported messaging packages currently include WhatsApp, WhatsApp Business, Telegram, Signal, Messenger, Instagram, Discord, Google Messages, Samsung Messages, Google Chat, Slack, Microsoft Teams, Skype, LINE, Viber, Snapchat, and Hinge.
+The backend needs Python 3.10+.
 
-## Backend Setup
-
-The backend uses FastAPI and requires Python 3.10+. Run it from PowerShell before testing the Android app.
-
-1. Create a `.env` file in the project root or `backend` folder:
+1. Create `.env` in the project root or `backend` folder:
 
 ```text
 GROQ_API_KEY=your_groq_api_key
 BACKEND_URL=http://YOUR_LAN_IP:3000/suggest
 ```
 
-The backend also accepts `LLM_API=...` for local compatibility, but `GROQ_API_KEY` is the clearest name.
-The Android Gradle build reads `BACKEND_URL` from `.env` and uses it as the default value for the app's `Backend URL` field. The FastAPI backend does not use `BACKEND_URL` as a Groq credential.
-
-2. Create and activate a Python virtual environment:
+2. Create the environment and install dependencies:
 
 ```powershell
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks activation, run this once in the same terminal and activate again:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-```
-
-3. Install backend dependencies:
-
-```powershell
 python -m pip install -r requirements.txt
 ```
 
-4. Start the backend on all network interfaces from inside the `backend` folder:
+3. Start the API:
 
 ```powershell
 python -m uvicorn main:app --host 0.0.0.0 --port 3000
 ```
 
-If your terminal is still in the project root, use this instead:
-
-```powershell
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 3000
-```
-
-Leave this terminal open while testing. You can also run the backend with:
-
-```powershell
-python main.py
-```
-
-5. Check that the backend is running:
+4. Verify it:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:3000/health
 ```
 
-You should see `ok` as `True` and `groqConfigured` as `True`. If `groqConfigured` is `False`, check your `.env` key name and value.
+Set the Android app's backend URL to `http://YOUR_LAN_IP:3000/suggest`. The phone and computer must be on the same Wi-Fi, and Windows Firewall must allow Python on private networks. If `BACKEND_URL` exists in `.env` before the Android build, it becomes the field's default value.
 
-6. Find your computer's LAN IP:
-
-```powershell
-ipconfig
-```
-
-Look for your Wi-Fi adapter's IPv4 address, for example `192.168.1.245`.
-
-7. Use this in the Android app's `Backend URL` field:
-
-```text
-http://YOUR_LAN_IP:3000/suggest
-```
-
-Example:
-
-```text
-http://192.168.1.245:3000/suggest
-```
-
-If `BACKEND_URL` is set in `.env` before you build/run from Android Studio, the app field is prefilled with that value. If you change `BACKEND_URL`, rebuild or rerun the app so Gradle regenerates `BuildConfig.DEFAULT_BACKEND_URL`.
-
-8. From your phone browser, test:
-
-```text
-http://YOUR_LAN_IP:3000/health
-```
-
-If this does not load, your phone is probably not on the same Wi-Fi or Windows Firewall is blocking Python. Allow Python/uvicorn on private networks, then retry.
-
-Optional model overrides before starting the backend:
+Optional model overrides:
 
 ```powershell
 $env:GROQ_VISION_MODEL="meta-llama/llama-4-scout-17b-16e-instruct"
 $env:GROQ_TEXT_MODEL="llama-3.3-70b-versatile"
+$env:CONTEXT_EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
 ```
 
-`GROQ_MODEL` is still accepted as a legacy alias for the vision model.
+Keep the Groq key on the backend—never put it in the APK. Use HTTPS and restricted CORS before any production deployment.
 
-Your phone and computer must be on the same Wi-Fi. The Android manifest allows cleartext HTTP for local MVP testing; use HTTPS for production.
+## Request shape
 
-## Current Limitations
+`POST /suggest` accepts the current WhatsApp context plus optional imported and automatically remembered history:
 
-- Android still requires explicit user approval for each screen-capture session. The app cannot silently start screen capture after reboot or without the MediaProjection prompt.
-- The supported-app launch prompt uses Android notifications. On Android 13+, notification permission must be granted before that prompt can appear.
-- Messaging-app scroll detection requires the user to enable the app's Accessibility service.
-- Automatic detection is limited to known Android messaging package names listed above.
-- Some protected screens may capture as black because Android apps can block screen capture.
-- ML Kit OCR extracts text locally; when a Groq backend URL is configured, the backend sends compressed screenshots to Llama 4 Scout for visual context, then sends the extracted context plus OCR text to Llama 3.3 70B for final reply generation.
-- API keys should stay on the backend. Do not put `GROQ_API_KEY` in Android code.
+```json
+{
+  "source_app": "WhatsApp",
+  "tone": "casual, natural, helpful",
+  "context_text": "OCR text from the current conversation",
+  "chat_history": "Alex: ...\nJamie: ...",
+  "chat_participants": ["Alex", "Jamie"],
+  "user_name": "Jamie",
+  "conversation_name": "Alex",
+  "automatic_history": "[Viewed WhatsApp context]\n...",
+  "images": []
+}
+```
+
+The backend validates imported history at 60,000 characters and automatic history at 80,000 characters. The MiniLM encoder retrieves relevant history; Groq generates exactly three clean, copyable suggestions. If the embedding model cannot load, retrieval falls back to a local lexical scorer.
+
+## Current limitations
+
+- WhatsApp export formats vary by locale. The parser supports the common bracketed iPhone form and date/time-hyphen Android form.
+- Automatic memory sees only text present in user-approved captures; it is not a silent full-account export.
+- Use a separate conversation label for each contact to avoid mixing context.
+- Group exports can be imported, but the experience is optimized for a one-to-one chat.
+- Protected screens can appear black if WhatsApp or Android blocks capture.
+- The Android manifest currently permits cleartext HTTP for LAN development only.
+- CORS is open for local development and must be restricted for production.

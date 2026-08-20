@@ -128,7 +128,7 @@ object MessagingAssistantPrompt {
 
         val notification = notificationBuilder(context)
             .setSmallIcon(android.R.drawable.ic_dialog_email)
-            .setContentTitle("Use Reply Assistant in $appName")
+            .setContentTitle("Use WhatsApp Reply Assistant")
             .setContentText("Tap to start capture and run suggestions in the background.")
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
@@ -168,10 +168,10 @@ object MessagingAssistantPrompt {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Messaging app prompts",
+            "WhatsApp prompts",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Prompts to start Reply Assistant from supported messaging apps."
+            description = "Prompts to start WhatsApp Reply Assistant from WhatsApp."
         }
 
         context.getSystemService(NotificationManager::class.java)
@@ -233,22 +233,7 @@ object MessagingScrollMonitor {
 object MessagingAppCatalog {
     private val knownMessagingPackages = linkedMapOf(
         "com.whatsapp" to "WhatsApp",
-        "com.whatsapp.w4b" to "WhatsApp Business",
-        "org.telegram.messenger" to "Telegram",
-        "org.thoughtcrime.securesms" to "Signal",
-        "com.facebook.orca" to "Messenger",
-        "com.instagram.android" to "Instagram",
-        "com.discord" to "Discord",
-        "com.google.android.apps.messaging" to "Google Messages",
-        "com.samsung.android.messaging" to "Samsung Messages",
-        "com.google.android.apps.dynamite" to "Google Chat",
-        "com.Slack" to "Slack",
-        "com.microsoft.teams" to "Microsoft Teams",
-        "com.skype.raider" to "Skype",
-        "jp.naver.line.android" to "LINE",
-        "com.viber.voip" to "Viber",
-        "com.snapchat.android" to "Snapchat",
-        "co.hinge.app" to "Hinge"
+        "com.whatsapp.w4b" to "WhatsApp Business"
     )
 
     fun isSupported(packageName: String): Boolean {
