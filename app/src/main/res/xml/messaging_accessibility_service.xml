@@ -2,7 +2,7 @@
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeViewScrolled|typeWindowStateChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
+    android:canPerformGestures="true"
     android:canRetrieveWindowContent="false"
     android:description="@string/accessibility_service_description"
-    android:packageNames="com.whatsapp,com.whatsapp.w4b"
     android:notificationTimeout="75" />

@@ -2,19 +2,23 @@ package com.replyassistant.accessibility
 
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Path
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import com.replyassistant.MainActivity
+import java.lang.ref.WeakReference
 import java.util.concurrent.CopyOnWriteArraySet
 
 class MessagingAccessibilityService : AccessibilityService() {
@@ -23,18 +27,69 @@ class MessagingAccessibilityService : AccessibilityService() {
     private var lastForegroundPackage: String? = null
     private var lastForegroundAt = 0L
 
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        MessagingGestureController.attach(this)
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val safeEvent = event ?: return
         val packageName = safeEvent.packageName?.toString() ?: return
-        if (!MessagingAppCatalog.isSupported(packageName)) return
+        if (!MessagingAppCatalog.isSupported(this, packageName)) return
 
         when (safeEvent.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> promptForSupportedAppIfNeeded(packageName)
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> dispatchScrollIfNeeded(packageName)
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                MessagingScrollMonitor.dispatchMessagingAppDetected(
+                    packageName = packageName,
+                    appName = MessagingAppCatalog.displayName(this, packageName)
+                )
+                promptForSupportedAppIfNeeded(packageName)
+            }
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                MessagingGestureController.reportScrollEvent(packageName, safeEvent)
+                dispatchScrollIfNeeded(packageName)
+            }
         }
     }
 
     override fun onInterrupt() = Unit
+
+    override fun onDestroy() {
+        MessagingGestureController.detach(this)
+        super.onDestroy()
+    }
+
+    fun scrollTowardConversationTop(onComplete: (Boolean) -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            onComplete(false)
+            return
+        }
+
+        val metrics = resources.displayMetrics
+        val x = metrics.widthPixels * 0.5f
+        val path = Path().apply {
+            moveTo(x, metrics.heightPixels * 0.32f)
+            lineTo(x, metrics.heightPixels * 0.78f)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 360L))
+            .build()
+
+        val accepted = dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    onComplete(true)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    onComplete(false)
+                }
+            },
+            null
+        )
+        if (!accepted) onComplete(false)
+    }
 
     private fun dispatchScrollIfNeeded(packageName: String) {
         val now = SystemClock.elapsedRealtime()
@@ -128,8 +183,8 @@ object MessagingAssistantPrompt {
 
         val notification = notificationBuilder(context)
             .setSmallIcon(android.R.drawable.ic_dialog_email)
-            .setContentTitle("Use WhatsApp Reply Assistant")
-            .setContentText("Tap to start capture and run suggestions in the background.")
+            .setContentTitle("Use Reply Assistant with $appName")
+            .setContentText("Tap to collect visible conversation context and suggest replies.")
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_RECOMMENDATION)
@@ -168,10 +223,10 @@ object MessagingAssistantPrompt {
 
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "WhatsApp prompts",
+            "Messaging app prompts",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "Prompts to start WhatsApp Reply Assistant from WhatsApp."
+            description = "Prompts to start Reply Assistant from supported messaging apps."
         }
 
         context.getSystemService(NotificationManager::class.java)
@@ -207,6 +262,7 @@ object MessagingScrollMonitor {
 
     interface Listener {
         fun onMessagingScrollDetected(packageName: String, appName: String)
+        fun onMessagingAppDetected(packageName: String, appName: String) = Unit
     }
 
     fun register(listener: Listener) {
@@ -228,16 +284,95 @@ object MessagingScrollMonitor {
             }
         }
     }
+
+    fun dispatchMessagingAppDetected(packageName: String, appName: String) {
+        mainHandler.post {
+            listeners.forEach { listener ->
+                listener.onMessagingAppDetected(packageName = packageName, appName = appName)
+            }
+        }
+    }
+}
+
+object MessagingGestureController {
+    private var serviceReference = WeakReference<MessagingAccessibilityService>(null)
+    @Volatile private var scanPackage: String? = null
+    @Volatile private var topReached = false
+
+    fun attach(service: MessagingAccessibilityService) {
+        serviceReference = WeakReference(service)
+    }
+
+    fun detach(service: MessagingAccessibilityService) {
+        if (serviceReference.get() === service) {
+            serviceReference.clear()
+        }
+    }
+
+    fun beginScan(packageName: String?) {
+        scanPackage = packageName
+        topReached = false
+    }
+
+    fun endScan() {
+        scanPackage = null
+        topReached = false
+    }
+
+    fun hasReachedTop(): Boolean = topReached
+
+    fun scrollTowardTop(onComplete: (Boolean) -> Unit) {
+        val service = serviceReference.get()
+        if (service == null) {
+            onComplete(false)
+            return
+        }
+        service.scrollTowardConversationTop(onComplete)
+    }
+
+    fun reportScrollEvent(packageName: String, event: AccessibilityEvent) {
+        val expectedPackage = scanPackage
+        if (expectedPackage != null && packageName != expectedPackage) return
+
+        val pixelAtTop = event.maxScrollY > 0 && event.scrollY == 0
+        if (pixelAtTop) {
+            topReached = true
+        }
+    }
 }
 
 object MessagingAppCatalog {
     private val knownMessagingPackages = linkedMapOf(
         "com.whatsapp" to "WhatsApp",
-        "com.whatsapp.w4b" to "WhatsApp Business"
+        "com.whatsapp.w4b" to "WhatsApp Business",
+        "org.telegram.messenger" to "Telegram",
+        "org.telegram.messenger.web" to "Telegram",
+        "org.thoughtcrime.securesms" to "Signal",
+        "com.facebook.orca" to "Messenger",
+        "com.instagram.android" to "Instagram",
+        "com.discord" to "Discord",
+        "com.snapchat.android" to "Snapchat",
+        "com.google.android.apps.messaging" to "Google Messages",
+        "com.samsung.android.messaging" to "Samsung Messages",
+        "com.microsoft.teams" to "Microsoft Teams",
+        "com.Slack" to "Slack",
+        "com.viber.voip" to "Viber",
+        "jp.naver.line.android" to "LINE",
+        "com.tencent.mm" to "WeChat",
+        "com.kakao.talk" to "KakaoTalk",
+        "com.skype.raider" to "Skype",
+        "org.mattermost.rn" to "Mattermost"
     )
 
-    fun isSupported(packageName: String): Boolean {
-        return knownMessagingPackages.containsKey(packageName)
+    fun isSupported(context: Context, packageName: String): Boolean {
+        if (packageName == context.packageName) return false
+        if (knownMessagingPackages.containsKey(packageName)) return true
+
+        return runCatching {
+            val info = context.packageManager.getApplicationInfo(packageName, 0)
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                info.category == ApplicationInfo.CATEGORY_SOCIAL
+        }.getOrDefault(false)
     }
 
     fun displayName(context: Context, packageName: String): String {

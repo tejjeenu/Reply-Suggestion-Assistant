@@ -12,7 +12,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Base64
@@ -93,11 +92,12 @@ import androidx.lifecycle.lifecycleScope
 import com.replyassistant.accessibility.AssistantSessionState
 import com.replyassistant.accessibility.MessagingAssistantPrompt
 import com.replyassistant.accessibility.MessagingAccessibilityService
+import com.replyassistant.accessibility.MessagingGestureController
 import com.replyassistant.accessibility.MessagingScrollMonitor
 import com.replyassistant.capture.CaptureService
 import com.replyassistant.chat.AutomaticConversationMemory
-import com.replyassistant.chat.WhatsAppChatContext
-import com.replyassistant.chat.WhatsAppChatParser
+import com.replyassistant.chat.ChatHistoryContext
+import com.replyassistant.chat.ChatHistoryParser
 import com.replyassistant.network.SuggestionApi
 import com.replyassistant.network.SuggestionImage
 import com.replyassistant.network.SuggestionRequest
@@ -119,7 +119,23 @@ data class CapturedText(
     val title: String,
     val text: String,
     val imageMimeType: String? = null,
-    val imageBase64: String? = null
+    val imageBase64: String? = null,
+    val isReplyTarget: Boolean = false
+)
+
+data class ResponseModeOption(
+    val id: String,
+    val label: String,
+    val description: String
+)
+
+private val ResponseModes = listOf(
+    ResponseModeOption("casual", "Casual", "relaxed and natural"),
+    ResponseModeOption("flirty", "Flirty", "playful when appropriate"),
+    ResponseModeOption("funny", "Funny", "light, contextual humour"),
+    ResponseModeOption("serious", "Serious", "direct and thoughtful"),
+    ResponseModeOption("supportive", "Supportive", "warm and encouraging"),
+    ResponseModeOption("professional", "Professional", "concise and work-ready")
 )
 
 private enum class PromptPermission {
@@ -140,9 +156,10 @@ class MainActivity : ComponentActivity() {
     private var backendUrl by mutableStateOf(
         SuggestionApi.normalizeSuggestEndpoint(BuildConfig.DEFAULT_BACKEND_URL)
     )
-    private var sourceApp by mutableStateOf("WhatsApp")
-    private var tone by mutableStateOf("casual, natural, helpful")
-    private var importedChat by mutableStateOf<WhatsAppChatContext?>(null)
+    private var sourceApp by mutableStateOf("Messaging app")
+    private var responseMode by mutableStateOf("casual")
+    private var tone by mutableStateOf("")
+    private var importedChat by mutableStateOf<ChatHistoryContext?>(null)
     private var chatUserName by mutableStateOf("")
     private var conversationName by mutableStateOf("")
     private var automaticMemoryEnabled by mutableStateOf(false)
@@ -153,23 +170,22 @@ class MainActivity : ComponentActivity() {
     private var accessibilityPermissionGranted by mutableStateOf(false)
     private var contextDraft by mutableStateOf("")
     private var suggestions by mutableStateOf<List<String>>(emptyList())
-    private var autoCaptureInFlight = false
+    private var autoSessionTranscript = ""
+    private var localReplyContext = ""
+    private var activeMessagingPackage: String? = null
+    private var fullConversationScanInProgress = false
+    private var fullConversationScanId = 0
     private var autoSuggestionInFlight = false
     private var autoScrollSessionActive = false
-    private var autoScrollSessionId = 0
-    private var lastAutoScrollAt = 0L
-    private var lastAutoCaptureAt = 0L
-    private var lastSuggestionPopupShownAt = 0L
-    private var autoCaptureSequence = 0
     private var promptedBackgroundStartRequested = false
     private var pendingStartBackgroundAfterCapture = false
     private var promptWaitingForPermission: PromptPermission? = null
-    private var pendingPromptSourceApp = "WhatsApp"
+    private var pendingPromptSourceApp = "Messaging app"
 
     private val chatImportLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
-        if (uri != null) importWhatsAppChat(uri)
+        if (uri != null) importChatHistory(uri)
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -226,12 +242,25 @@ class MainActivity : ComponentActivity() {
                 handleMessagingScroll(packageName = packageName, appName = appName)
             }
         }
+
+        override fun onMessagingAppDetected(packageName: String, appName: String) {
+            runOnUiThread {
+                activeMessagingPackage = packageName
+                sourceApp = appName
+            }
+        }
     }
 
     private val overlayListener = object : CaptureService.OverlayListener {
         override fun onOverlayCaptureRequested() {
             runOnUiThread {
                 captureAndRunOcr(fromFloatingControl = true)
+            }
+        }
+
+        override fun onOverlayScanConversationRequested() {
+            runOnUiThread {
+                scanConversationToTop()
             }
         }
 
@@ -273,6 +302,7 @@ class MainActivity : ComponentActivity() {
                     isBusy = isBusy,
                     statusMessage = statusMessage,
                     backendUrl = backendUrl,
+                    responseMode = responseMode,
                     tone = tone,
                     autoAssistantEnabled = autoAssistantEnabled,
                     overlayPermissionGranted = overlayPermissionGranted,
@@ -286,6 +316,7 @@ class MainActivity : ComponentActivity() {
                     automaticMemoryEnabled = automaticMemoryEnabled,
                     automaticMemoryCount = automaticMemoryCount,
                     onBackendUrlChange = { backendUrl = it },
+                    onResponseModeChange = ::updateResponseMode,
                     onToneChange = { tone = it },
                     onImportChat = { chatImportLauncher.launch(arrayOf("text/plain")) },
                     onRemoveChat = ::removeImportedChat,
@@ -325,12 +356,15 @@ class MainActivity : ComponentActivity() {
         }
         if (autoAssistantEnabled && !accessibilityPermissionGranted) {
             updateAutoAssistantEnabled(false)
-            updateStatus("Background assistant stopped because WhatsApp detection is disabled.")
+            updateStatus("Background assistant stopped because messaging app detection is disabled.")
         }
         resumePromptedBackgroundStartIfNeeded()
     }
 
     override fun onDestroy() {
+        fullConversationScanInProgress = false
+        fullConversationScanId += 1
+        MessagingGestureController.endScan()
         MessagingScrollMonitor.unregister(messagingScrollListener)
         if (autoAssistantEnabled) {
             AssistantSessionState.setBackgroundAssistantActive(this, false)
@@ -385,12 +419,12 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != MessagingAssistantPrompt.ACTION_START_BACKGROUND_ASSISTANT) return
 
         pendingPromptSourceApp = intent.getStringExtra(MessagingAssistantPrompt.EXTRA_SOURCE_APP)
-            ?: "WhatsApp"
+            ?: "Messaging app"
         sourceApp = pendingPromptSourceApp
         promptedBackgroundStartRequested = true
         promptWaitingForPermission = null
         MessagingAssistantPrompt.dismiss(this)
-        updateStatus("Start WhatsApp Reply Assistant for $pendingPromptSourceApp.")
+        updateStatus("Start Reply Assistant for $pendingPromptSourceApp.")
         continuePromptedBackgroundStart()
     }
 
@@ -403,7 +437,7 @@ class MainActivity : ComponentActivity() {
         when (waitingFor) {
             PromptPermission.ACCESSIBILITY -> {
                 if (!accessibilityPermissionGranted) {
-                    updateStatus("Enable WhatsApp Reply Assistant in Accessibility settings to detect WhatsApp.")
+                    updateStatus("Enable Reply Assistant in Accessibility settings to detect messaging app scrolls.")
                     return
                 }
             }
@@ -459,12 +493,12 @@ class MainActivity : ComponentActivity() {
             Uri.parse("package:$packageName")
         )
         startActivity(intent)
-        updateStatus("Enable display-over-other-apps permission, then return to WhatsApp Reply Assistant.")
+        updateStatus("Enable display-over-other-apps permission, then return to Reply Assistant.")
     }
 
     private fun requestAccessibilityPermission() {
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        updateStatus("Enable WhatsApp Reply Assistant in Accessibility settings, then return.")
+        updateStatus("Enable Reply Assistant in Accessibility settings, then return.")
     }
 
     private fun updateFloatingControlEnabled(enabled: Boolean) {
@@ -523,13 +557,14 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
-            captureService?.hideFloatingControl()
             captureService?.hideSuggestionPopup()
             captures.clear()
+            localReplyContext = ""
+            autoSessionTranscript = ""
             contextDraft = ""
             updateSuggestions(emptyList())
             resetAutoScrollSession()
-            floatingControlEnabled = false
+            floatingControlEnabled = true
             autoAssistantEnabled = true
             promptedBackgroundStartRequested = false
             pendingStartBackgroundAfterCapture = false
@@ -537,7 +572,8 @@ class MainActivity : ComponentActivity() {
             AssistantSessionState.setBackgroundAssistantActive(this, true)
             MessagingAssistantPrompt.dismiss(this)
             MessagingScrollMonitor.register(messagingScrollListener)
-            updateStatus("Background assistant active. Open WhatsApp and scroll the conversation.")
+            captureService?.let(::showFloatingControlIfPossible)
+            updateStatus("Open a conversation at its latest message, then tap Scan conversation to top.")
             moveTaskToBack(true)
         } else {
             autoAssistantEnabled = false
@@ -551,176 +587,172 @@ class MainActivity : ComponentActivity() {
 
     private fun handleMessagingScroll(packageName: String, appName: String) {
         if (!autoAssistantEnabled) return
-        if (!isBound || captureService == null) {
-            updateStatus("Background assistant paused. Start a capture session again.")
-            return
-        }
-
-        val now = SystemClock.elapsedRealtime()
-        if (autoSuggestionInFlight) {
-            return
-        }
-
-        if (isWithinSuggestionPopupGracePeriod(now)) {
-            return
-        }
-
-        if (!autoScrollSessionActive) {
-            startAutoScrollSession(appName)
-        }
-
-        autoScrollSessionId += 1
-        lastAutoScrollAt = now
+        activeMessagingPackage = packageName
         sourceApp = appName
-        captureService?.hideSuggestionPopup()
-        lastSuggestionPopupShownAt = 0L
-
-        if (!autoCaptureInFlight && now - lastAutoCaptureAt >= AUTO_CAPTURE_SAMPLE_INTERVAL_MS) {
-            captureAutoScrollFrame(appName)
-        }
-
-        scheduleSuggestionsAfterScrollStop(
-            sessionId = autoScrollSessionId,
-            appName = appName
-        )
     }
 
-    private fun startAutoScrollSession(appName: String) {
+    private fun scanConversationToTop() {
+        if (fullConversationScanInProgress) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            updateStatus("Automatic conversation scanning requires Android 7.0 or newer.")
+            return
+        }
+        if (!isBound || captureService == null) {
+            updateStatus("Start a capture session before scanning the conversation.")
+            return
+        }
+        refreshAccessibilityPermissionStatus()
+        if (!accessibilityPermissionGranted) {
+            requestAccessibilityPermission()
+            return
+        }
+
+        fullConversationScanId += 1
+        val scanId = fullConversationScanId
+        fullConversationScanInProgress = true
         autoScrollSessionActive = true
+        autoSuggestionInFlight = true
         captures.clear()
+        localReplyContext = ""
+        autoSessionTranscript = ""
         contextDraft = ""
         updateSuggestions(emptyList())
-        autoCaptureSequence = 0
-        lastAutoCaptureAt = 0L
-        updateStatus("Scroll detected in $appName. Collecting screenshots...")
-    }
-
-    private fun captureAutoScrollFrame(appName: String) {
-        lastAutoCaptureAt = SystemClock.elapsedRealtime()
-        autoCaptureInFlight = true
+        captureService?.hideSuggestionPopup()
+        captureService?.hideFloatingControl()
+        MessagingGestureController.beginScan(activeMessagingPackage)
         updateBusy(true)
 
         lifecycleScope.launch {
-            delay(AUTO_CAPTURE_SETTLE_DELAY_MS)
+            var completedAtTop = false
+            var stableFrames = 0
+            var gesturesCompleted = 0
 
-            if (!autoAssistantEnabled || autoSuggestionInFlight) {
-                autoCaptureInFlight = false
-                updateBusy(false)
-                return@launch
-            }
+            try {
+                delay(FULL_SCAN_OVERLAY_HIDE_DELAY_MS)
+                updateStatus("Capturing the latest messages as the local reply target...")
+                val localCapture = captureAndStoreScreenshot(
+                    title = "$sourceApp local reply target",
+                    isReplyTarget = true
+                )
+                if (localCapture.getOrNull() != true || localReplyContext.isBlank()) {
+                    throw localCapture.exceptionOrNull()
+                        ?: IOException("No readable local reply context was found.")
+                }
 
-            autoCaptureSequence += 1
+                var previousText = captures.lastOrNull()?.text.orEmpty()
+                while (
+                    fullConversationScanInProgress &&
+                    scanId == fullConversationScanId &&
+                    gesturesCompleted < MAX_FULL_SCAN_GESTURES
+                ) {
+                    if (MessagingGestureController.hasReachedTop()) {
+                        completedAtTop = true
+                        break
+                    }
 
-            val captureResult = captureAndStoreScreenshot(
-                title = "$appName scroll $autoCaptureSequence"
-            )
+                    updateStatus(
+                        "Scanning older $sourceApp messages… ${gesturesCompleted + 1}/$MAX_FULL_SCAN_GESTURES"
+                    )
+                    val gestureCompleted = requestScrollTowardConversationTop()
+                    if (!gestureCompleted) {
+                        throw IOException("The accessibility service could not perform the scroll gesture.")
+                    }
+                    delay(FULL_SCAN_CAPTURE_SETTLE_MS)
 
-            captureResult
-                .onSuccess {
+                    gesturesCompleted += 1
+                    val historyCapture = captureAndStoreScreenshot(
+                        title = "$sourceApp older context $gesturesCompleted"
+                    )
+                    historyCapture.exceptionOrNull()?.let { throw it }
                     pruneCaptures(MAX_AUTO_CAPTURE_HISTORY)
-                    updateStatus("Collecting screenshots from $appName...")
-                }
-                .onFailure { error ->
-                    updateStatus("Auto capture failed: ${error.message}")
+
+                    val currentText = captures.lastOrNull()?.text.orEmpty()
+                    stableFrames = if (screensAreEffectivelyEqual(previousText, currentText)) {
+                        stableFrames + 1
+                    } else {
+                        0
+                    }
+                    previousText = currentText
+
+                    if (stableFrames >= REQUIRED_STABLE_TOP_FRAMES) {
+                        completedAtTop = true
+                        break
+                    }
                 }
 
-            updateBusy(false)
-            autoCaptureInFlight = false
+                if (!fullConversationScanInProgress || scanId != fullConversationScanId) {
+                    return@launch
+                }
+
+                updateStatus(
+                    if (completedAtTop) {
+                        "Top reached. Combining local reply context with the scanned conversation history..."
+                    } else {
+                        "Scan safety limit reached. Using the conversation context collected so far..."
+                    }
+                )
+                val nextSuggestions = requestSuggestions().getOrElse { error ->
+                    throw IOException("Suggestion request failed: ${error.message}", error)
+                }
+                updateSuggestions(nextSuggestions)
+
+                val popupShown = nextSuggestions.isNotEmpty() &&
+                    captureService?.showSuggestionPopup(
+                        title = "Replies from local + full-chat context",
+                        suggestions = nextSuggestions
+                    ) == true
+                updateStatus(
+                    if (popupShown) {
+                        "Scan complete. Suggestions combine the latest messages with relevant global history."
+                    } else {
+                        "Scan complete. Suggestions are ready in Reply Assistant."
+                    }
+                )
+            } catch (error: Exception) {
+                updateStatus("Conversation scan failed: ${error.message}")
+            } finally {
+                if (scanId == fullConversationScanId) {
+                    fullConversationScanInProgress = false
+                    autoScrollSessionActive = false
+                    autoSuggestionInFlight = false
+                    MessagingGestureController.endScan()
+                    updateBusy(false)
+                    captureService?.showFloatingControl()
+                    syncFloatingPanelState()
+                }
+            }
         }
     }
 
-    private fun scheduleSuggestionsAfterScrollStop(sessionId: Int, appName: String) {
-        lifecycleScope.launch {
-            delay(AUTO_SCROLL_STOP_QUIET_MS)
-
-            val quietForMs = SystemClock.elapsedRealtime() - lastAutoScrollAt
-            if (
-                !autoAssistantEnabled ||
-                sessionId != autoScrollSessionId ||
-                quietForMs < AUTO_SCROLL_STOP_QUIET_MS
-            ) {
-                return@launch
+    private suspend fun requestScrollTowardConversationTop(): Boolean {
+        return suspendCancellableCoroutine { continuation ->
+            MessagingGestureController.scrollTowardTop { completed ->
+                if (continuation.isActive) {
+                    continuation.resume(completed)
+                }
             }
-
-            generateAutoSuggestionsAfterScrollStop(
-                sessionId = sessionId,
-                appName = appName
-            )
         }
     }
 
-    private suspend fun generateAutoSuggestionsAfterScrollStop(sessionId: Int, appName: String) {
-        if (autoSuggestionInFlight) return
+    private fun screensAreEffectivelyEqual(previous: String, current: String): Boolean {
+        val previousTokens = previous.lowercase()
+            .split(Regex("\\s+"))
+            .filter { it.length > 1 }
+            .toSet()
+        val currentTokens = current.lowercase()
+            .split(Regex("\\s+"))
+            .filter { it.length > 1 }
+            .toSet()
+        if (previousTokens.isEmpty() || currentTokens.isEmpty()) return false
 
-        while (autoCaptureInFlight) {
-            delay(80)
-        }
-
-        if (!autoAssistantEnabled || sessionId != autoScrollSessionId) return
-
-        autoSuggestionInFlight = true
-        updateBusy(true)
-
-        if (captures.isEmpty()) {
-            updateStatus("Scrolling stopped in $appName. Capturing final context...")
-            autoCaptureSequence += 1
-            captureAndStoreScreenshot(title = "$appName final")
-                .onSuccess { pruneCaptures(MAX_AUTO_CAPTURE_HISTORY) }
-                .onFailure { error -> updateStatus("Final capture failed: ${error.message}") }
-        }
-
-        if (contextDraft.trim().isBlank()) {
-            updateStatus("Scrolling stopped, but no context was captured.")
-            autoSuggestionInFlight = false
-            autoScrollSessionActive = false
-            updateBusy(false)
-            return
-        }
-
-        updateStatus("Scrolling stopped in $appName. Generating replies from ${captures.size} screenshots...")
-        val suggestionResult = requestSuggestions()
-        val nextSuggestions = suggestionResult.getOrElse { error ->
-            updateStatus("Suggestion request failed: ${error.message}")
-            emptyList()
-        }
-        updateSuggestions(nextSuggestions)
-
-        if (nextSuggestions.isNotEmpty()) {
-            val popupShown = captureService?.showSuggestionPopup(
-                title = "Reply suggestions",
-                suggestions = nextSuggestions
-            ) ?: false
-            if (popupShown) {
-                lastSuggestionPopupShownAt = SystemClock.elapsedRealtime()
-            }
-            updateStatus(
-                if (popupShown) {
-                    "Suggestions shown for $appName."
-                } else {
-                    "Suggestions ready. Enable popup permission to show them."
-                }
-            )
-        }
-
-        autoSuggestionInFlight = false
-        autoScrollSessionActive = false
-        updateBusy(false)
+        val intersection = previousTokens.intersect(currentTokens).size.toDouble()
+        val union = previousTokens.union(currentTokens).size.toDouble()
+        return union > 0 && intersection / union >= TOP_SCREEN_SIMILARITY_THRESHOLD
     }
 
     private fun resetAutoScrollSession() {
-        autoScrollSessionId += 1
         autoScrollSessionActive = false
-        autoCaptureInFlight = false
         autoSuggestionInFlight = false
-        lastAutoScrollAt = 0L
-        lastAutoCaptureAt = 0L
-        lastSuggestionPopupShownAt = 0L
-        autoCaptureSequence = 0
-    }
-
-    private fun isWithinSuggestionPopupGracePeriod(now: Long): Boolean {
-        val shownAt = lastSuggestionPopupShownAt
-        return shownAt > 0L && now - shownAt < SUGGESTION_POPUP_SCROLL_GRACE_MS
     }
 
     private fun requestScreenCapture() {
@@ -744,8 +776,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopCapture() {
+        fullConversationScanInProgress = false
+        fullConversationScanId += 1
+        MessagingGestureController.endScan()
         autoAssistantEnabled = false
-        autoCaptureInFlight = false
         promptedBackgroundStartRequested = false
         pendingStartBackgroundAfterCapture = false
         promptWaitingForPermission = null
@@ -782,7 +816,12 @@ class MainActivity : ComponentActivity() {
                 delay(250)
             }
 
-            val result = captureAndStoreScreenshot()
+            captures.removeAll { it.isReplyTarget }
+            localReplyContext = ""
+            val result = captureAndStoreScreenshot(
+                title = "$sourceApp local reply target",
+                isReplyTarget = true
+            )
             updateStatus(result.fold(
                 onSuccess = { hadText ->
                     if (hadText) {
@@ -798,7 +837,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun captureAndStoreScreenshot(title: String? = null): Result<Boolean> {
+    private suspend fun captureAndStoreScreenshot(
+        title: String? = null,
+        isReplyTarget: Boolean = false
+    ): Result<Boolean> {
         val service = captureService
         if (!isBound || service == null) {
             return Result.failure(IOException("Start a capture session first."))
@@ -822,16 +864,25 @@ class MainActivity : ComponentActivity() {
                                         title = title ?: "Screenshot ${captures.size + 1}",
                                         text = cleanedText.ifBlank { "No readable text found." },
                                         imageMimeType = imageForVision?.mimeType,
-                                        imageBase64 = imageForVision?.base64
+                                        imageBase64 = imageForVision?.base64,
+                                        isReplyTarget = isReplyTarget
                                     )
                                     captures.add(capture)
                                     if (automaticMemoryEnabled && cleanedText.isNotBlank()) {
                                         automaticMemoryCount = conversationMemoryStore.append(
                                             conversationName = conversationName,
-                                            visibleText = cleanedText
+                                            visibleText = cleanedText,
+                                            sourceApp = sourceApp
                                         ).snapshotCount
                                     }
-                                    contextDraft = buildContextDraft()
+                                    if (isReplyTarget) {
+                                        localReplyContext = "[${capture.title}]\n${capture.text}"
+                                        contextDraft = localReplyContext
+                                    } else if (autoScrollSessionActive) {
+                                        appendToAutoSessionTranscript(capture)
+                                    } else {
+                                        contextDraft = buildContextDraft()
+                                    }
                                     updateSuggestions(emptyList())
                                     syncFloatingPanelState()
 
@@ -898,32 +949,40 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun requestSuggestions(): Result<List<String>> {
-        val contextText = contextDraft.trim()
+        val contextText = localReplyContext.trim().ifBlank { contextDraft.trim() }
         if (contextText.isBlank()) {
             return Result.failure(IOException("Capture or enter some context first."))
         }
 
         return runCatching {
+            val requestCaptures = captures.takeLast(MAX_AUTO_CAPTURE_HISTORY)
             SuggestionApi.suggestReplies(
                 endpoint = backendUrl.trim(),
                 request = SuggestionRequest(
                     sourceApp = sourceApp,
+                    responseMode = responseMode,
                     tone = tone,
                     contextText = contextText,
+                    scannedHistory = autoSessionTranscript,
                     chatHistory = importedChat?.historyExcerpt.orEmpty(),
                     chatParticipants = importedChat?.participants.orEmpty(),
                     userName = chatUserName.trim(),
                     conversationName = conversationName.trim(),
                     automaticHistory = conversationMemoryStore.load(conversationName).history,
-                    images = captures.takeLast(5).mapNotNull { it.toSuggestionImage() }
+                    images = requestCaptures.mapIndexedNotNull { index, capture ->
+                        capture.toSuggestionImage(
+                            treatAsReplyTarget = capture.isReplyTarget ||
+                                (localReplyContext.isBlank() && index == requestCaptures.lastIndex)
+                        )
+                    }
                 )
             )
         }
     }
 
-    private fun importWhatsAppChat(uri: Uri) {
+    private fun importChatHistory(uri: Uri) {
         updateBusy(true)
-        updateStatus("Importing WhatsApp chat...")
+        updateStatus("Importing conversation history...")
         lifecycleScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
@@ -942,7 +1001,7 @@ class MainActivity : ComponentActivity() {
                         }
                         output.toString()
                     } ?: throw IOException("Could not open the selected file.")
-                    WhatsAppChatParser.parse(fileName, rawText)
+                    ChatHistoryParser.parse(fileName, rawText)
                 }
             }
 
@@ -950,7 +1009,7 @@ class MainActivity : ComponentActivity() {
                 importedChat = chat
                 if (chatUserName !in chat.participants) chatUserName = ""
                 saveImportedChat(chat)
-                updateStatus("Imported ${chat.messageCount} WhatsApp messages. Choose your name in the export.")
+                updateStatus("Imported ${chat.messageCount} messages. Choose your name in the transcript.")
             }.onFailure { error ->
                 updateStatus("Chat import failed: ${error.message}")
             }
@@ -964,7 +1023,17 @@ class MainActivity : ComponentActivity() {
                 if (cursor.moveToFirst()) cursor.getString(0) else null
             }
             ?: uri.lastPathSegment
-            ?: "WhatsApp chat.txt"
+            ?: "Conversation history.txt"
+    }
+
+    private fun updateResponseMode(value: String) {
+        responseMode = ResponseModes.firstOrNull { it.id == value }?.id ?: "casual"
+        updateSuggestions(emptyList())
+        getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_RESPONSE_MODE, responseMode)
+            .apply()
+        updateStatus("${ResponseModes.first { it.id == responseMode }.label} response mode selected.")
     }
 
     private fun updateChatUserName(value: String) {
@@ -994,7 +1063,7 @@ class MainActivity : ComponentActivity() {
 
     private fun updateAutomaticMemoryEnabled(enabled: Boolean) {
         if (enabled && conversationName.isBlank()) {
-            updateStatus("Name this WhatsApp conversation before enabling automatic memory.")
+            updateStatus("Name this conversation before enabling automatic memory.")
             return
         }
         automaticMemoryEnabled = enabled
@@ -1004,7 +1073,7 @@ class MainActivity : ComponentActivity() {
             .apply()
         updateStatus(
             if (enabled) {
-                "Automatic memory enabled for $conversationName. Viewed WhatsApp context will be stored locally."
+                "Automatic memory enabled for $conversationName. Viewed messaging context will be stored locally."
             } else {
                 "Automatic memory paused. Existing local context is still available."
             }
@@ -1028,10 +1097,10 @@ class MainActivity : ComponentActivity() {
             .remove(KEY_CHAT_HISTORY)
             .remove(KEY_CHAT_USER_NAME)
             .apply()
-        updateStatus("Imported WhatsApp chat removed from this app.")
+        updateStatus("Imported conversation history removed from this app.")
     }
 
-    private fun saveImportedChat(chat: WhatsAppChatContext) {
+    private fun saveImportedChat(chat: ChatHistoryContext) {
         getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_CHAT_FILE_NAME, chat.fileName)
@@ -1051,8 +1120,8 @@ class MainActivity : ComponentActivity() {
             val array = JSONArray(participantJson)
             List(array.length()) { index -> array.getString(index) }
         }.getOrDefault(emptyList())
-        importedChat = WhatsAppChatContext(
-            fileName = prefs.getString(KEY_CHAT_FILE_NAME, "WhatsApp chat.txt").orEmpty(),
+        importedChat = ChatHistoryContext(
+            fileName = prefs.getString(KEY_CHAT_FILE_NAME, "Conversation history.txt").orEmpty(),
             participants = participants,
             messageCount = prefs.getInt(KEY_CHAT_MESSAGE_COUNT, 0),
             historyExcerpt = history
@@ -1063,12 +1132,17 @@ class MainActivity : ComponentActivity() {
     private fun restoreAutomaticMemorySettings() {
         val prefs = getSharedPreferences(CHAT_PREFS_NAME, Context.MODE_PRIVATE)
         conversationName = prefs.getString(KEY_CONVERSATION_NAME, "").orEmpty()
+        responseMode = prefs.getString(KEY_RESPONSE_MODE, "casual")
+            ?.takeIf { saved -> ResponseModes.any { it.id == saved } }
+            ?: "casual"
         automaticMemoryEnabled = prefs.getBoolean(KEY_AUTOMATIC_MEMORY_ENABLED, false)
         automaticMemoryCount = conversationMemoryStore.load(conversationName).snapshotCount
     }
 
     private fun removeCapture(id: Long) {
+        val removedReplyTarget = captures.firstOrNull { it.id == id }?.isReplyTarget == true
         captures.removeAll { it.id == id }
+        if (removedReplyTarget) localReplyContext = ""
         contextDraft = buildContextDraft()
         updateSuggestions(emptyList())
         syncFloatingPanelState()
@@ -1076,14 +1150,25 @@ class MainActivity : ComponentActivity() {
 
     private fun pruneCaptures(maxCount: Int) {
         while (captures.size > maxCount) {
-            captures.removeAt(0)
+            val replyTargetIndex = captures.indexOfFirst { it.isReplyTarget }
+            val removableIndex = if (replyTargetIndex == 0 && captures.size > 2) {
+                (1 + RECENT_GLOBAL_SCREENSHOTS_TO_KEEP).coerceAtMost(captures.lastIndex - 1)
+            } else {
+                captures.indexOfFirst { !it.isReplyTarget }
+            }
+            if (removableIndex == -1) break
+            captures.removeAt(removableIndex)
         }
-        contextDraft = buildContextDraft()
+        if (!autoScrollSessionActive) {
+            contextDraft = buildContextDraft()
+        }
         syncFloatingPanelState()
     }
 
     private fun clearFloatingPanelContext() {
         captures.clear()
+        autoSessionTranscript = ""
+        localReplyContext = ""
         contextDraft = ""
         updateSuggestions(emptyList())
         updateStatus("Floating panel cleared.")
@@ -1093,6 +1178,21 @@ class MainActivity : ComponentActivity() {
         return captures.joinToString(separator = "\n\n") { capture ->
             "[${capture.title}]\n${capture.text}"
         }
+    }
+
+    private fun appendToAutoSessionTranscript(capture: CapturedText): String {
+        val nextEntry = "[${capture.title}]\n${capture.text}"
+        val combined = listOf(autoSessionTranscript, nextEntry)
+            .filter { it.isNotBlank() }
+            .joinToString("\n\n")
+        autoSessionTranscript = if (combined.length <= MAX_SCROLL_SESSION_CONTEXT_CHARS) {
+            combined
+        } else {
+            val omissionMarker = "\n\n[Middle scan context omitted due to local limit]\n\n"
+            val sideBudget = (MAX_SCROLL_SESSION_CONTEXT_CHARS - omissionMarker.length) / 2
+            combined.take(sideBudget) + omissionMarker + combined.takeLast(sideBudget)
+        }
+        return autoSessionTranscript
     }
 
     private fun updateStatus(message: String) {
@@ -1146,12 +1246,16 @@ class MainActivity : ComponentActivity() {
         private const val KEY_CHAT_USER_NAME = "user_name"
         private const val KEY_CONVERSATION_NAME = "conversation_name"
         private const val KEY_AUTOMATIC_MEMORY_ENABLED = "automatic_memory_enabled"
+        private const val KEY_RESPONSE_MODE = "response_mode"
         private const val MAX_IMPORT_CHARS = 12_000_000
-        private const val AUTO_CAPTURE_SETTLE_DELAY_MS = 350L
-        private const val AUTO_CAPTURE_SAMPLE_INTERVAL_MS = 900L
-        private const val AUTO_SCROLL_STOP_QUIET_MS = 1_400L
-        private const val SUGGESTION_POPUP_SCROLL_GRACE_MS = 1_500L
-        private const val MAX_AUTO_CAPTURE_HISTORY = 5
+        private const val MAX_AUTO_CAPTURE_HISTORY = 12
+        private const val RECENT_GLOBAL_SCREENSHOTS_TO_KEEP = 5
+        private const val MAX_SCROLL_SESSION_CONTEXT_CHARS = 80_000
+        private const val MAX_FULL_SCAN_GESTURES = 120
+        private const val FULL_SCAN_OVERLAY_HIDE_DELAY_MS = 300L
+        private const val FULL_SCAN_CAPTURE_SETTLE_MS = 550L
+        private const val REQUIRED_STABLE_TOP_FRAMES = 3
+        private const val TOP_SCREEN_SIMILARITY_THRESHOLD = 0.985
     }
 }
 
@@ -1228,10 +1332,15 @@ object ScreenshotEncoder {
     }
 }
 
-private fun CapturedText.toSuggestionImage(): SuggestionImage? {
+private fun CapturedText.toSuggestionImage(treatAsReplyTarget: Boolean): SuggestionImage? {
     val mimeType = imageMimeType ?: return null
     val base64 = imageBase64 ?: return null
-    return SuggestionImage(mimeType = mimeType, base64 = base64)
+    return SuggestionImage(
+        mimeType = mimeType,
+        base64 = base64,
+        role = if (treatAsReplyTarget) "reply_target" else "history",
+        title = title
+    )
 }
 
 object TextCleaner {
@@ -1274,6 +1383,7 @@ fun ReplyAssistantScreen(
     isBusy: Boolean,
     statusMessage: String,
     backendUrl: String,
+    responseMode: String,
     tone: String,
     autoAssistantEnabled: Boolean,
     overlayPermissionGranted: Boolean,
@@ -1281,12 +1391,13 @@ fun ReplyAssistantScreen(
     captures: List<CapturedText>,
     contextDraft: String,
     suggestions: List<String>,
-    importedChat: WhatsAppChatContext?,
+    importedChat: ChatHistoryContext?,
     chatUserName: String,
     conversationName: String,
     automaticMemoryEnabled: Boolean,
     automaticMemoryCount: Int,
     onBackendUrlChange: (String) -> Unit,
+    onResponseModeChange: (String) -> Unit,
     onToneChange: (String) -> Unit,
     onImportChat: () -> Unit,
     onRemoveChat: () -> Unit,
@@ -1325,7 +1436,7 @@ fun ReplyAssistantScreen(
             }
 
             item {
-                WhatsAppChatPanel(
+                ChatHistoryPanel(
                     importedChat = importedChat,
                     chatUserName = chatUserName,
                     conversationName = conversationName,
@@ -1338,6 +1449,14 @@ fun ReplyAssistantScreen(
                     onConversationNameChange = onConversationNameChange,
                     onAutomaticMemoryChange = onAutomaticMemoryChange,
                     onClearAutomaticMemory = onClearAutomaticMemory
+                )
+            }
+
+            item {
+                ResponseModePanel(
+                    selectedMode = responseMode,
+                    isBusy = isBusy,
+                    onModeChange = onResponseModeChange
                 )
             }
 
@@ -1450,12 +1569,12 @@ private fun Header(statusMessage: String, isBusy: Boolean, autoAssistantEnabled:
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "WhatsApp Reply Assistant",
+                        text = "Reply Assistant",
                         style = MaterialTheme.typography.headlineSmall,
                         color = AppInk
                     )
                     Text(
-                        text = if (autoAssistantEnabled) "Watching WhatsApp scrolls" else "WhatsApp companion",
+                        text = if (autoAssistantEnabled) "Floating scan control active" else "Messaging companion",
                         style = MaterialTheme.typography.bodySmall,
                         color = AppMuted
                     )
@@ -1502,8 +1621,8 @@ private fun Header(statusMessage: String, isBusy: Boolean, autoAssistantEnabled:
 }
 
 @Composable
-private fun WhatsAppChatPanel(
-    importedChat: WhatsAppChatContext?,
+private fun ChatHistoryPanel(
+    importedChat: ChatHistoryContext?,
     chatUserName: String,
     conversationName: String,
     automaticMemoryEnabled: Boolean,
@@ -1529,7 +1648,7 @@ private fun WhatsAppChatPanel(
         ) {
             Text("Automatic conversation memory", style = MaterialTheme.typography.titleMedium, color = AppInk)
             Text(
-                "With your consent, text visible during WhatsApp captures is saved locally and reused for future replies. It cannot collect messages you never open.",
+                "With your consent, text visible during messaging app captures is saved locally and reused for future replies. It cannot collect messages you never open.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = AppMuted
             )
@@ -1569,7 +1688,7 @@ private fun WhatsAppChatPanel(
             Text("Optional history import", style = MaterialTheme.typography.titleSmall, color = AppInk)
             if (importedChat == null) {
                 Text(
-                    "To backfill messages you have not viewed in the app, import a WhatsApp .txt export without media.",
+                    "To backfill older messages, import a plain-text transcript. WhatsApp exports and 'Name: message' transcripts are supported.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = AppMuted
                 )
@@ -1581,7 +1700,7 @@ private fun WhatsAppChatPanel(
                 ) {
                     Icon(Icons.Rounded.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(7.dp))
-                    Text("Import WhatsApp chat")
+                    Text("Import conversation history")
                 }
             } else {
                 Text(
@@ -1619,6 +1738,69 @@ private fun WhatsAppChatPanel(
                     color = AppMuted
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun ResponseModePanel(
+    selectedMode: String,
+    isBusy: Boolean,
+    onModeChange: (String) -> Unit
+) {
+    val selected = ResponseModes.firstOrNull { it.id == selectedMode } ?: ResponseModes.first()
+    Surface(
+        color = AppSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, AppLine),
+        shadowElevation = 1.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Response mode", style = MaterialTheme.typography.titleMedium, color = AppInk)
+            Text(
+                "Choose how every suggestion should sound. Context and relationship safety still take priority.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = AppMuted
+            )
+            ResponseModes.chunked(3).forEach { rowModes ->
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    rowModes.forEach { mode ->
+                        if (mode.id == selected.id) {
+                            Button(
+                                onClick = { onModeChange(mode.id) },
+                                enabled = !isBusy,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppPrimary)
+                            ) {
+                                Text(mode.label, maxLines = 1)
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onModeChange(mode.id) },
+                                enabled = !isBusy,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, AppLine)
+                            ) {
+                                Text(mode.label, maxLines = 1)
+                            }
+                        }
+                    }
+                }
+            }
+            Text(
+                "${selected.label}: ${selected.description}",
+                style = MaterialTheme.typography.bodySmall,
+                color = AppMuted
+            )
         }
     }
 }
@@ -1806,7 +1988,8 @@ private fun DetailsPanel(
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 shape = RoundedCornerShape(8.dp),
-                label = { Text("Tone") }
+                label = { Text("Additional style guidance") },
+                supportingText = { Text("Optional detail layered onto the selected response mode.") }
             )
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                 OutlinedButton(

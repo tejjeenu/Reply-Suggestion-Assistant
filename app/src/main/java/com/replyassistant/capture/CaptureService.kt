@@ -446,7 +446,7 @@ class CaptureService : Service() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(5.dp(), 4.dp(), 5.dp(), 7.dp())
-            contentDescription = "WhatsApp Reply Assistant panel"
+            contentDescription = "Reply Assistant panel"
             setOnTouchListener(
                 FloatingOverlayTouchListener {
                     animateCompactBubbleExpansion(this) {
@@ -574,7 +574,7 @@ class CaptureService : Service() {
 
         titleColumn.addView(
             TextView(this).apply {
-                text = "WhatsApp Reply Assistant"
+                text = "Reply Assistant"
                 textSize = 15.5f
                 setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL))
                 setTextColor(PANEL_TEXT)
@@ -670,6 +670,21 @@ class CaptureService : Service() {
                 bottomMargin = 8.dp()
             }
         }
+
+        rows.addView(
+            actionButton("Scan conversation to top", enabled = !floatingPanelState.isBusy) {
+                overlayListener?.onOverlayScanConversationRequested()
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    40.dp()
+                ).apply {
+                    leftMargin = 3.dp()
+                    rightMargin = 3.dp()
+                    bottomMargin = 6.dp()
+                }
+            }
+        )
 
         rows.addView(
             actionRow(
@@ -1139,7 +1154,7 @@ class CaptureService : Service() {
 
         return builder
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("WhatsApp Reply Assistant")
+            .setContentTitle("Reply Assistant")
             .setContentText("Capturing screen context")
             .setOngoing(true)
             .build()
@@ -1168,6 +1183,7 @@ class CaptureService : Service() {
 
     interface OverlayListener {
         fun onOverlayCaptureRequested()
+        fun onOverlayScanConversationRequested()
         fun onOverlayGenerateRequested()
         fun onOverlayClearRequested()
         fun onOverlayClosed()

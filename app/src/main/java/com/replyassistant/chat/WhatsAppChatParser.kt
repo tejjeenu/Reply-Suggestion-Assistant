@@ -1,13 +1,13 @@
 package com.replyassistant.chat
 
-data class WhatsAppChatContext(
+data class ChatHistoryContext(
     val fileName: String,
     val participants: List<String>,
     val messageCount: Int,
     val historyExcerpt: String
 )
 
-object WhatsAppChatParser {
+object ChatHistoryParser {
     private const val MAX_HISTORY_CHARS = 60_000
     private const val EARLY_MESSAGE_COUNT = 80
 
@@ -18,13 +18,18 @@ object WhatsAppChatParser {
     private val iosLine = Regex(
         """^\s*[\u200e\u200f]?\[[^]]+]\s*([^:]+):\s?(.*)$"""
     )
+    private val genericLine = Regex(
+        """^\s*([^:\n]{1,80}):\s+(.+)$"""
+    )
 
-    fun parse(fileName: String, rawText: String): WhatsAppChatContext {
+    fun parse(fileName: String, rawText: String): ChatHistoryContext {
         val messages = mutableListOf<ChatMessage>()
         var current: ChatMessage? = null
 
         rawText.removePrefix("\uFEFF").lineSequence().forEach { line ->
-            val match = androidLine.matchEntire(line) ?: iosLine.matchEntire(line)
+            val match = androidLine.matchEntire(line)
+                ?: iosLine.matchEntire(line)
+                ?: genericLine.matchEntire(line)
             if (match != null) {
                 current?.let(messages::add)
                 current = ChatMessage(
@@ -39,14 +44,14 @@ object WhatsAppChatParser {
 
         if (messages.isEmpty()) {
             throw IllegalArgumentException(
-                "No WhatsApp messages were found. Export the chat without media and choose the .txt file."
+                "No messages were found. Choose a text transcript with lines such as 'Alex: hello'."
             )
         }
 
         val participants = messages.map { it.sender }.distinct()
         val excerpt = buildExcerpt(messages)
-        return WhatsAppChatContext(
-            fileName = fileName.ifBlank { "WhatsApp chat.txt" },
+        return ChatHistoryContext(
+            fileName = fileName.ifBlank { "Conversation history.txt" },
             participants = participants,
             messageCount = messages.size,
             historyExcerpt = excerpt

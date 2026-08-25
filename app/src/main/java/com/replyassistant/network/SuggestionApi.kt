@@ -10,8 +10,10 @@ import java.net.URL
 
 data class SuggestionRequest(
     val sourceApp: String,
+    val responseMode: String,
     val tone: String,
     val contextText: String,
+    val scannedHistory: String = "",
     val chatHistory: String = "",
     val chatParticipants: List<String> = emptyList(),
     val userName: String = "",
@@ -22,7 +24,9 @@ data class SuggestionRequest(
 
 data class SuggestionImage(
     val mimeType: String,
-    val base64: String
+    val base64: String,
+    val role: String = "history",
+    val title: String = ""
 )
 
 object SuggestionApi {
@@ -49,22 +53,24 @@ object SuggestionApi {
     ): List<String> = withContext(Dispatchers.IO) {
         val normalizedEndpoint = normalizeSuggestEndpoint(endpoint)
         if (normalizedEndpoint.isBlank()) {
-            return@withContext localSuggestions(request.contextText)
+            return@withContext localSuggestions(request.responseMode)
         }
 
         val connection = URL(normalizedEndpoint).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "POST"
             connection.connectTimeout = 15_000
-            connection.readTimeout = 30_000
+            connection.readTimeout = 150_000
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json")
 
             val payload = JSONObject()
                 .put("task", "suggest_reply")
                 .put("source_app", request.sourceApp)
+                .put("response_mode", request.responseMode)
                 .put("tone", request.tone)
                 .put("context_text", request.contextText)
+                .put("scanned_history", request.scannedHistory)
                 .put("chat_history", request.chatHistory)
                 .put("chat_participants", JSONArray(request.chatParticipants))
                 .put("user_name", request.userName)
@@ -73,11 +79,13 @@ object SuggestionApi {
 
             if (request.images.isNotEmpty()) {
                 val images = JSONArray()
-                request.images.take(5).forEach { image ->
+                request.images.take(12).forEach { image ->
                     images.put(
                         JSONObject()
                             .put("mime_type", image.mimeType)
                             .put("base64", image.base64)
+                            .put("role", image.role)
+                            .put("title", image.title)
                     )
                 }
                 payload.put("images", images)
@@ -98,13 +106,13 @@ object SuggestionApi {
                 throw IOException("Backend returned HTTP $responseCode: $responseBody")
             }
 
-            parseSuggestions(responseBody)
+            parseSuggestions(responseBody, request.responseMode)
         } finally {
             connection.disconnect()
         }
     }
 
-    private fun parseSuggestions(responseBody: String): List<String> {
+    private fun parseSuggestions(responseBody: String, responseMode: String): List<String> {
         return runCatching {
             val json = JSONObject(responseBody)
             val array = when {
@@ -126,24 +134,38 @@ object SuggestionApi {
                 .filter { it.length > 2 }
                 .take(5)
         }.ifEmpty {
-            localSuggestions("")
+            localSuggestions(responseMode)
         }
     }
 
-    private fun localSuggestions(contextText: String): List<String> {
-        val lastUsefulLine = contextText
-            .lines()
-            .map { it.trim() }
-            .lastOrNull { it.length >= 8 }
-
-        return if (lastUsefulLine == null) {
-            listOf(
-                "Sounds good, tell me more.",
-                "That makes sense. What happened next?",
-                "I get you. How are you feeling about it?"
+    private fun localSuggestions(responseMode: String): List<String> {
+        return when (responseMode.trim().lowercase()) {
+            "flirty" -> listOf(
+                "okay, that was dangerously charming 😏",
+                "keep talking like that and i might get attached",
+                "bold of you to be this cute in my messages"
             )
-        } else {
-            listOf(
+            "funny" -> listOf(
+                "plot twist: i was pretending to know what was happening",
+                "fair point, my last brain cell agrees",
+                "i'll allow it, but only because that made me laugh"
+            )
+            "serious" -> listOf(
+                "I hear you. Let’s talk it through properly.",
+                "Thanks for being honest with me. I want to understand.",
+                "This matters to me, so I’d rather be direct about it."
+            )
+            "supportive" -> listOf(
+                "I’m here with you. You don’t have to handle it alone.",
+                "That sounds really hard. Want to talk about what happened?",
+                "Take your time—I’m listening whenever you’re ready."
+            )
+            "professional" -> listOf(
+                "Thanks for the update. I’ll review it and follow up shortly.",
+                "That works for me. Please send the details when convenient.",
+                "Understood. I’ll confirm the next steps by tomorrow."
+            )
+            else -> listOf(
                 "Haha fair, I get what you mean.",
                 "That sounds interesting. Tell me more.",
                 "I like that. What made you think of it?"
