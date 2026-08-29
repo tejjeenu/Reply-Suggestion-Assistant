@@ -59,15 +59,16 @@ load_env_files(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API") or ""
 GROQ_VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
-    os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+    os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b"),
 )
-GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
+GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 CONTEXT_EMBEDDING_MODEL = os.getenv(
     "CONTEXT_EMBEDDING_MODEL",
     "sentence-transformers/bert-base-nli-mean-tokens",
 )
 MAX_IMAGES_PER_REQUEST = 12
-VISION_BATCH_SIZE = 4
+MAX_VISION_IMAGES_PER_REQUEST = 3
+VISION_BATCH_SIZE = 3
 MAX_TOTAL_IMAGE_BASE64_CHARS = int(os.getenv("MAX_TOTAL_IMAGE_BASE64_CHARS", "9000000"))
 ALLOWED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
@@ -149,6 +150,7 @@ async def health() -> dict[str, Any]:
         "contextEmbeddingModel": CONTEXT_EMBEDDING_MODEL,
         "responseModes": list(RESPONSE_MODE_INSTRUCTIONS),
         "maxImagesPerRequest": MAX_IMAGES_PER_REQUEST,
+        "maxVisionImagesPerRequest": MAX_VISION_IMAGES_PER_REQUEST,
     }
 
 
@@ -353,11 +355,12 @@ async def call_groq(
     images: list[dict[str, str]],
 ) -> dict[str, Any]:
     vision_context: dict[str, Any] = {}
-    if images:
+    vision_images = select_vision_images(images)
+    if vision_images:
         vision_context = await call_groq_vision(
             source_app=source_app,
             context_text=context_text,
-            images=images,
+            images=vision_images,
         )
 
     return await call_groq_text(
@@ -371,9 +374,38 @@ async def call_groq(
         user_name=user_name,
         conversation_name=conversation_name,
         automatic_history=automatic_history,
-        image_count=len(images),
+        image_count=len(vision_images),
         vision_context=vision_context,
     )
+
+
+def select_vision_images(
+    images: list[dict[str, str]],
+    limit: int = MAX_VISION_IMAGES_PER_REQUEST,
+) -> list[dict[str, str]]:
+    if limit <= 0 or not images:
+        return []
+    if len(images) <= limit:
+        return images
+
+    reply_target_index = next(
+        (
+            index
+            for index in range(len(images) - 1, -1, -1)
+            if images[index].get("role") == "reply_target"
+        ),
+        None,
+    )
+    if reply_target_index is None:
+        return images[-limit:]
+
+    selected_indices = {reply_target_index}
+    nearby_indices = sorted(
+        (index for index in range(len(images)) if index != reply_target_index),
+        key=lambda index: (abs(index - reply_target_index), index),
+    )
+    selected_indices.update(nearby_indices[: limit - 1])
+    return [images[index] for index in sorted(selected_indices)]
 
 
 async def call_groq_vision(
@@ -486,7 +518,6 @@ async def call_groq_vision_batch(
         "model": GROQ_VISION_MODEL,
         "temperature": 0.1,
         "max_completion_tokens": 900,
-        "response_format": {"type": "json_object"},
         "messages": [
             {
                 "role": "system",
@@ -619,6 +650,17 @@ async def post_groq_chat_completion(payload: dict[str, Any], stage: str) -> str:
             },
             json=payload,
         )
+        if should_retry_without_json_mode(response, payload):
+            retry_payload = dict(payload)
+            retry_payload.pop("response_format", None)
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=retry_payload,
+            )
 
     if response.status_code < 200 or response.status_code >= 300:
         raise HTTPException(
@@ -632,6 +674,19 @@ async def post_groq_chat_completion(payload: dict[str, Any], stage: str) -> str:
         .get("message", {})
         .get("content", "")
     )
+
+
+def should_retry_without_json_mode(
+    response: httpx.Response,
+    payload: dict[str, Any],
+) -> bool:
+    if response.status_code != 400 or "response_format" not in payload:
+        return False
+    try:
+        error = response.json().get("error", {})
+    except (ValueError, AttributeError):
+        return False
+    return error.get("code") == "json_validate_failed"
 
 
 def extract_reply_result(content: str) -> dict[str, Any]:

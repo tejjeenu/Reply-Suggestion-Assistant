@@ -1,4 +1,4 @@
 - forget being whatsapp specific sorry, make the app purposed for any messaging app
-- use a BERT model and use scroll actions and screenshots to construct the full context of the entire chat, using a vision model to extract text and media as context (could use llama 4 scout vision model)
+- use a BERT model and use scroll actions and screenshots to construct the full context of the entire chat, using a vision model to extract text and media as context (currently Qwen 3.6 27B)
 - use that with the BERT model as it allows deep understanding of text
 - allow the app to have different response modes e.g. flirty, funny, serious etc....

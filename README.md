@@ -26,7 +26,7 @@ This category check prevents the assistant from reacting to every ordinary app s
 
 - The latest screen is kept separately as local reply context and remains authoritative about what needs a response.
 - The scan retains up to 80,000 characters of global OCR history, preserving both the recent and oldest ends if the limit is reached.
-- Up to 12 representative screenshots are retained for vision analysis: the local target, nearby global context, and older global context.
+- Up to 12 representative screenshots are retained locally. For each suggestion request, the reply target and its two nearest screenshots are selected for vision analysis; OCR history supplies the remaining scanned context.
 - Optional automatic memory is bounded to 120 unique snapshots and 100,000 stored characters per conversation label.
 - Up to 80,000 characters of automatic memory can be sent to the configured backend only when generating a reply.
 - Images are used for the current request and are not added to long-term memory.
@@ -37,9 +37,9 @@ This category check prevents the assistant from reacting to every ordinary app s
 
 The backend uses two complementary stages:
 
-- `meta-llama/llama-4-scout-17b-16e-instruct` extracts an ordered transcript and relevant visible media context from screenshot batches.
+- `qwen/qwen3.6-27b` extracts an ordered transcript and relevant visible media context from screenshot batches.
 - `sentence-transformers/bert-base-nli-mean-tokens` embeds the current OCR plus vision context and retrieves the most semantically relevant conversation chunks. If the BERT model cannot load, retrieval falls back to a local lexical scorer.
-- `llama-3.3-70b-versatile` generates exactly three short, copyable replies using the selected response mode and retrieved context.
+- `openai/gpt-oss-120b` generates exactly three short, copyable replies using the selected response mode and retrieved context.
 
 Model names can be overridden with environment variables.
 
@@ -92,8 +92,8 @@ Set the Android app's backend URL to `http://YOUR_LAN_IP:3000/suggest`. The phon
 Optional model overrides:
 
 ```powershell
-$env:GROQ_VISION_MODEL="meta-llama/llama-4-scout-17b-16e-instruct"
-$env:GROQ_TEXT_MODEL="llama-3.3-70b-versatile"
+$env:GROQ_VISION_MODEL="qwen/qwen3.6-27b"
+$env:GROQ_TEXT_MODEL="openai/gpt-oss-120b"
 $env:CONTEXT_EMBEDDING_MODEL="sentence-transformers/bert-base-nli-mean-tokens"
 ```
 
